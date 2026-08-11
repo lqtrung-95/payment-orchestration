@@ -144,23 +144,20 @@ make check         # fmt, vet, lint, test
 ## Architecture
 
 ```mermaid
-graph TB
+flowchart TB
     Client -->|Idempotency-Key| MW[Idempotency middleware]
     MW -->|claim committed first| IK[(idempotency_keys)]
     MW --> H[Payment handler]
     H --> S[Payment service]
-    S -->|one transaction| TX[(payment_transactions)]
-    S -->|one transaction| AUD[(transaction_state_changes)]
-    S -. "capture, later phase" .-> LG[(journal_entries and postings)]
+    S -->|same transaction| TX[(payment_transactions)]
+    S -->|same transaction| AUD[(transaction_state_changes)]
+    S --> LG[(journal entries and postings)]
 
-    TX -.->|trigger| SM[transaction_state_transitions]
-    LG -.->|deferred trigger| BAL{{entries must balance}}
-
-    subgraph "Not built yet"
-        PSP[PSP adapters + fault simulator]
-        OB[Outbox → Kafka → retry/DLQ]
-        WH[Webhook ingest + dedup]
-        REC[FX + reconciliation]
+    subgraph planned [Not built yet]
+        PSP[PSP adapters and fault simulator]
+        OB[Outbox to Kafka to retry ladder to DLQ]
+        WH[Webhook ingest and dedup]
+        REC[FX and reconciliation]
     end
 
     S -.-> PSP
@@ -169,7 +166,10 @@ graph TB
     LG -.-> REC
 ```
 
-Solid edges exist today; dotted edges and the boxed subgraph do not.
+Solid edges exist today. The boxed subgraph and the dotted edges into it do not.
+
+Postings begin at capture, which needs a provider — so the ledger edge is wired
+and tested but not yet reachable from the HTTP surface.
 
 One service with enforced module boundaries, deliberately not microservices — a
 distributed monolith would be a worse design, not a better one, at this size.
