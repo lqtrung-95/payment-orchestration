@@ -1,0 +1,13 @@
+# Scrape config for the local stack. The orchestrator runs on the host during
+# development, so it is reached through the Docker host gateway rather than a
+# container name.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: payment-orchestrator
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+    metrics_path: /metrics

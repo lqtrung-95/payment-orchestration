@@ -1,0 +1,70 @@
+# Lint configuration.
+#
+# The selection favours correctness over style. Per the project's code standards,
+# formatting nits should not block work, but anything that can silently produce
+# a wrong result on a payment path should.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    # Unchecked errors on a payment path are how money quietly goes missing.
+    - errcheck
+    # errors.Is/As correctness — retry decisions branch on error identity, and
+    # a string comparison that works today breaks on the next wrapping change.
+    - errorlint
+    # Context must reach every external call so timeouts and cancellation
+    # actually propagate to the PSP client and the database.
+    - noctx
+    - contextcheck
+    # Leaked response bodies exhaust connection pools under load.
+    - bodyclose
+    # SQL resources: unchecked rows.Err() hides partial reads as empty results.
+    - rowserrcheck
+    - sqlclosecheck
+    - gosec
+    - revive
+    - misspell
+    - unconvert
+    - wastedassign
+    - nilerr
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    revive:
+      rules:
+        - name: exported
+          # Exported identifiers without comments are noisy to enforce this
+          # early; revisit once the public surface stabilises.
+          disabled: true
+    gosec:
+      excludes:
+        # Integer conversion audit. Money is int64 minor units throughout and
+        # conversions are deliberate; re-enable if that invariant ever loosens.
+        - G115
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test code legitimately uses weak randomness, fixed credentials against
+      # the local stack, and unchecked cleanup errors.
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/lequoctrung/payment-orchestrator
