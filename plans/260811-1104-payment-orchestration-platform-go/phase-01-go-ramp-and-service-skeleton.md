@@ -65,7 +65,7 @@ Single binary, module boundaries enforced by package layout. No microservices.
 - [x] pgx pool + `WithTx` helper
 - [x] Migration tooling + bootstrap migration
 - [x] Structured logging with request ID
-- [x] CI pipeline written (unverified — no remote yet)
+- [x] CI pipeline green on GitHub Actions
 - [ ] Ramp exercise complete
 
 ## Verified on 2026-08-11
@@ -79,6 +79,15 @@ Toolchain: Go 1.26.5, Colima 0.10.3 + Docker 29.7.2, golangci-lint 2.12.2.
 - Inbound `X-Request-ID` echoed when well-formed; header-injection attempt (`bad id with spaces`) discarded and replaced with a fresh UUID
 - SIGTERM → ordered drain, "shutdown complete", exit 0, port released
 - `vet` clean, `golangci-lint` 0 issues, tests pass under `-race`
+
+CI verified green on GitHub Actions against
+[lqtrung-95/payment-orchestration](https://github.com/lqtrung-95/payment-orchestration)
+— both jobs pass, including integration tests against a service-container
+Postgres and the up/down/up migration round trip. The first run failed:
+`golangci-lint-action@v6` rejects a golangci-lint v2 version string, fixed by
+moving to `@v7`. Remaining annotation is a Node 20 deprecation warning on the
+setup actions, which currently run forced onto Node 24; harmless until those
+actions are bumped.
 
 ## Success criteria
 
