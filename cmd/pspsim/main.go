@@ -28,7 +28,7 @@ func main() {
 }
 
 func run() error {
-	addr := envOr("PSPSIM_ADDR", ":9090")
+	addr := envOr("PSPSIM_ADDR", ":9091")
 	preset := envOr("PSPSIM_PRESET", simulator.PresetHealthy)
 	webhookURL := envOr("PSPSIM_WEBHOOK_URL", "")
 	webhookSecret := envOr("PSPSIM_WEBHOOK_SECRET", "sim-webhook-secret")

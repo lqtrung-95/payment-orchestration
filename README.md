@@ -10,10 +10,11 @@ times, out of order, before the API call that created the transaction returned.
 A settlement file that disagrees with your ledger by three cents. The happy path
 is a CRUD app; the failure paths are the actual problem.
 
-> **Status: in progress — 3 of 10 phases complete.**
-> Built and tested: ledger, state machine, idempotency, provider abstraction, and
-> a provider simulator that fails on purpose.
-> Webhook ingestion, queueing, and reconciliation are not built yet.
+> **Status: in progress — 4 of 10 phases complete.**
+> Built and tested: ledger, state machine, idempotency, provider abstraction, a
+> provider simulator that fails on purpose, and an asynchronous pipeline —
+> transactional outbox, Kafka, error-aware retries, DLQ.
+> Webhook ingestion and reconciliation are not built yet.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -39,6 +40,8 @@ the four places that write this table."
 | One key ⇒ one execution | `UNIQUE (merchant_id, key)` inside a committed tx | No |
 | Concurrent writers can't clobber | `version` column, optimistic lock | No |
 | A payment is never failed on an unknown outcome | `GetStatus` recovery; unresolved stays non-terminal | No |
+| Queued work is never lost or invented | Outbox row written in the domain transaction | No |
+| A declined payment is never retried | Retry policy keyed on the error class | No |
 
 Three of these deserve explanation.
 
@@ -98,6 +101,31 @@ endpoint lags — the transaction stays **non-terminal** and says so. A false
 "authorized" is recoverable by reconciliation; a false "failed" is money quietly
 gone. See [ADR 0006](docs/adr/0006-ambiguous-provider-outcomes-are-resolved-not-guessed.md).
 
+### Retries are driven by the error class
+
+"Retry everything a few times" is wrong in both directions — it repeats declines
+and it retries ambiguous failures blindly. The policy is keyed on the taxonomy:
+
+| Class | Policy |
+|---|---|
+| `Timeout`, `NetworkError` | Retry, but confirm via `GetStatus` first |
+| `Unknown` | One confirmation attempt, then alert |
+| `RateLimited`, `Unavailable` | Retry on the slower tiers |
+| `Declined`, `InsufficientFunds`, `DoNotHonor` | **Never** |
+| `SuspectedFraud` | Never, and alert |
+| `InvalidInstrument` | Never, until re-verified |
+
+Delay is modelled as four topics (5s / 30s / 5m / 30m) whose consumers wait
+until a message is due, not as sleeps inside a handler — a consumer restart must
+not lose scheduled retries. Backoff uses **full jitter**, because callers that
+back off deterministically all wake at the same instant and knock a recovering
+provider straight back over.
+
+Exhausting the ladder parks the message in a DLQ with its reason and origin.
+Nothing is dropped. `dlqctl` lists and replays, and replay demands `--actor` and
+`--reason` — it moves money, and the first question afterwards is always who
+decided to.
+
 ### The provider misbehaves on purpose
 
 `cmd/pspsim` is a separate process implementing a deliberately unreliable
@@ -126,7 +154,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 81 tests, green in
+Measured on this repo, not projected. 109 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -171,6 +199,20 @@ process killed outright mid-flow: the transaction stays `authorizing`, never
 **Reproducible chaos** — the same seed produces identical fault verdicts
 regardless of call order or concurrency; different seeds diverge.
 
+**Asynchronous pipeline, over real Kafka** — create → outbox → relay → Kafka →
+worker → authorized, with isolated topics per test run. A decline reaches
+`failed` with zero provider charges and zero retry-tier messages. A duplicate
+delivery does not run the work twice. Exhausted retries land in the DLQ without
+the transaction being marked failed.
+
+**No duplicate publishes** — four concurrent publishers over 120 messages
+deliver each exactly once. This test caught a real bug: `FOR UPDATE SKIP LOCKED`
+alone released its locks when the claim transaction committed, so every
+publisher re-sent the same batch. Claiming by lease fixed it.
+
+**A rolled-back payment leaves no queued work**, and a committed one leaves
+exactly one message — the property the outbox exists for.
+
 ## Try it
 
 Requires Go 1.26+ and a container runtime.
@@ -182,6 +224,13 @@ make migrate-up
 make run
 ```
 
+Start the worker and the provider simulator in separate terminals:
+
+```bash
+make pspsim        # the provider that fails on purpose
+make worker        # consumes Kafka, calls providers
+```
+
 Create a payment:
 
 ```bash
@@ -191,6 +240,10 @@ curl -X POST http://localhost:8080/v1/payments \
   -H 'Content-Type: application/json' \
   -d '{"amount":12550,"currency":"USD"}'
 ```
+
+The response comes back in the `created` state in a few tens of milliseconds:
+authorization happens in the worker, so the caller never waits on a third party.
+`GET /v1/payments/{id}` shows it reach `authorized`.
 
 Send it again with the same key — you get the identical response and an
 `Idempotency-Replayed: true` header, and no second transaction. Send it with a
@@ -217,41 +270,50 @@ make check         # fmt, vet, lint, test
 ```mermaid
 flowchart TB
     Client -->|Idempotency-Key| MW[Idempotency middleware]
-    MW -->|claim committed first| IK[(idempotency_keys)]
     MW --> H[Payment handler]
     H --> S[Payment service]
-    S -->|same transaction| TX[(payment_transactions)]
-    S -->|same transaction| AUD[(transaction_state_changes)]
-    S --> LG[(journal entries and postings)]
+    S -->|one transaction| TX[(payment_transactions)]
+    S -->|one transaction| AUD[(transaction_state_changes)]
+    S -->|one transaction| OB[(outbox)]
+
+    OB --> REL[Outbox relay]
+    REL -->|key = merchant| K[Kafka]
+    K --> W[Worker]
+    W --> PSP[PSP adapters and fault simulator]
+    W --> RT[Retry tiers 5s 30s 5m 30m]
+    RT --> K
+    W --> DLQ[Dead letter queue]
+    W --> LG[(journal entries and postings)]
 
     subgraph planned [Not built yet]
-        PSP[PSP adapters and fault simulator]
-        OB[Outbox to Kafka to retry ladder to DLQ]
         WH[Webhook ingest and dedup]
         REC[FX and reconciliation]
     end
 
-    S -.-> PSP
-    S -.-> OB
-    WH -.-> S
+    WH -.-> W
     LG -.-> REC
 ```
 
 Solid edges exist today. The boxed subgraph and the dotted edges into it do not.
 
-Postings begin at capture, which needs a provider — so the ledger edge is wired
-and tested but not yet reachable from the HTTP surface.
+The transaction, its audit row, and the queue message are written in **one**
+database transaction — that atomicity is what makes queued work neither lost nor
+invented. Postings begin at capture, which has no HTTP surface yet.
 
 One service with enforced module boundaries, deliberately not microservices — a
 distributed monolith would be a worse design, not a better one, at this size.
 
 ```
-cmd/          orchestrator, migrate, pspsim
+cmd/          orchestrator, worker, migrate, pspsim, dlqctl
 internal/
   domain/     money, ledger, transaction   — no I/O, no framework types
   store/      repositories                  — take a Querier, so callers own the tx boundary
-  psp/        provider contract, error taxonomy, adapters
+  psp/        provider contract, error taxonomy, retry policy, adapters
   simulator/  the provider that fails on purpose
+  outbox/     transactional outbox writer and relay
+  messaging/  Kafka topics, producer, consumer group
+  worker/     queue handlers, dedup
+  resilience/ backoff with full jitter, circuit breaker
   service/    orchestration
   transport/  Hertz handlers + middleware
   platform/   postgres, redis, kafka, telemetry, sharding
@@ -291,8 +353,11 @@ Stated plainly, because a README that omits them is not worth reading.
   carry a throughput figure until one has actually been measured.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
-- **Authorization runs inline** in the request. Phase 04 moves it behind the
-  transactional outbox so the caller stops waiting on a third party.
+- **Consumer lag is not exported.** A message stuck in a retry tier is invisible
+  without inspecting Kafka by hand; Phase 09 fixes this.
+- **`processed_events` grows unbounded** — it needs a pruning job.
+- **The DLQ needs someone to watch it.** A dead letter queue nobody looks at is
+  a slower way of dropping messages.
 
 ## Roadmap
 
@@ -301,15 +366,14 @@ Stated plainly, because a README that omits them is not worth reading.
 | 01 | Service skeleton, config, migrations, CI | Done |
 | 02 | Ledger, transaction state machine, idempotency | Done |
 | 03 | PSP abstraction + deliberately misbehaving simulator | Done |
-| 04 | Transactional outbox → Kafka → retry ladder → DLQ | Next |
-| 05 | Webhook ingest, dedup, out-of-order tolerance | |
+| 04 | Transactional outbox → Kafka → retry ladder → DLQ | Done |
+| 05 | Webhook ingest, dedup, out-of-order tolerance | Next |
 | 06 | Payment instrument binding + lifecycle | |
 | 07 | FX conversion + settlement reconciliation | |
 | 08 | Sharding + cross-shard transactions (TCC) | |
 | 09 | OpenTelemetry, load + chaos testing | |
 | 10 | Architecture docs and demo | |
 
-Phase 04 moves authorization off the request path: a transactional outbox so the
-domain write and the queue write commit together, then a tiered retry ladder
-whose policy is driven by the error taxonomy above — because the one thing a
-retry must never do is repeat a decline or guess at an ambiguous outcome.
+Phase 05 answers the inbound half: webhooks arriving duplicated, out of order,
+and sometimes before the API call that created the transaction has returned. The
+faults for all three already exist in the simulator, waiting for a receiver.

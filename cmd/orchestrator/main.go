@@ -11,7 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kgo"
+
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
+	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/kafka"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/redis"
@@ -103,7 +107,37 @@ func run() error {
 		slog.Any("providers", providers.Names()),
 		slog.String("default", cfg.PSP.DefaultProvider))
 
-	paymentService := payment.NewService(db, txstore.NewRepository(), providers, logger)
+	// Producer for the outbox relay. Full ISR acknowledgement: a message the
+	// broker has not durably accepted is one that can vanish, and this one
+	// represents a payment.
+	producerClient, err := kgo.NewClient(
+		kgo.SeedBrokers(cfg.Kafka.Brokers...),
+		kgo.ClientID(cfg.Kafka.ClientID+"-outbox"),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.ProducerLinger(0),
+	)
+	if err != nil {
+		return err
+	}
+	defer producerClient.Close()
+
+	if err := messaging.EnsureTopics(ctx, producerClient, messaging.DefaultTopics()); err != nil {
+		return err
+	}
+
+	paymentService := payment.NewService(db, txstore.NewRepository(), providers,
+		outbox.NewWriter(), messaging.DefaultTopics(), logger)
+
+	// The relay runs alongside the API. It is safe to run in every instance —
+	// the claim query uses FOR UPDATE SKIP LOCKED, so instances take disjoint
+	// rows rather than blocking on each other.
+	publisher := outbox.NewPublisher(db, messaging.NewProducer(producerClient),
+		outbox.DefaultPublisherConfig(), logger)
+	go func() {
+		if err := publisher.Run(ctx); err != nil {
+			logger.ErrorContext(ctx, "outbox publisher stopped", slog.Any("error", err))
+		}
+	}()
 
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,

@@ -21,6 +21,8 @@ import (
 
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
 	domain "github.com/lequoctrung/payment-orchestrator/internal/domain/transaction"
+	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
@@ -32,11 +34,23 @@ type Service struct {
 	db        *postgres.DB
 	txRepo    *txstore.Repository
 	providers *psp.Registry
+	outbox    *outbox.Writer
+	topics    messaging.Topics
 	logger    *slog.Logger
 }
 
-func NewService(db *postgres.DB, txRepo *txstore.Repository, providers *psp.Registry, logger *slog.Logger) *Service {
-	return &Service{db: db, txRepo: txRepo, providers: providers, logger: logger}
+func NewService(
+	db *postgres.DB,
+	txRepo *txstore.Repository,
+	providers *psp.Registry,
+	outboxWriter *outbox.Writer,
+	topics messaging.Topics,
+	logger *slog.Logger,
+) *Service {
+	return &Service{
+		db: db, txRepo: txRepo, providers: providers,
+		outbox: outboxWriter, topics: topics, logger: logger,
+	}
 }
 
 type CreateInput struct {
@@ -61,42 +75,59 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*domain.Transacti
 		return nil, err
 	}
 
+	// The transaction, its first audit row, and the message that will drive its
+	// authorization are written in one database transaction.
+	//
+	// This atomicity is the reason the outbox exists. Publishing to the broker
+	// inside the transaction would emit work for a payment that then rolls back;
+	// publishing after the commit loses the work whenever the process dies in
+	// between. Writing both to the same database makes the pair all-or-nothing,
+	// and a separate relay carries it to the broker afterwards.
 	err = s.db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if err := s.txRepo.Insert(ctx, tx, t); err != nil {
 			return err
 		}
-		return s.txRepo.RecordStateChange(ctx, tx, txstore.StateChange{
+		if err := s.txRepo.RecordStateChange(ctx, tx, txstore.StateChange{
 			TransactionID: t.ID,
 			To:            t.State,
 			Reason:        "payment created",
 			Actor:         in.Actor,
 			SourceIP:      in.SourceIP,
+		}); err != nil {
+			return err
+		}
+
+		_, err := s.outbox.Enqueue(ctx, tx, outbox.Message{
+			AggregateID: t.ID,
+			// Keyed by merchant so every event for one merchant is ordered
+			// relative to the others.
+			PartitionKey: t.MerchantID,
+			Topic:        s.topics.Authorize,
+			Payload: AuthorizeRequested{
+				TransactionID: t.ID,
+				MerchantID:    t.MerchantID,
+			},
 		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create payment: %w", err)
 	}
 
-	// Authorization runs inline for now. A later phase moves it behind the
-	// transactional outbox, at which point this call becomes an enqueue and the
-	// request stops waiting on a third party.
-	//
-	// A provider decline is not a request failure: the payment resource exists
-	// and its state carries the outcome. Authorize returns the transaction
-	// alongside any provider error and returns nil only when something
-	// infrastructural broke, so a non-nil transaction is the answer.
-	authorized, authErr := s.Authorize(ctx, t.ID)
-	if authorized != nil {
-		if authErr != nil {
-			s.logger.InfoContext(ctx, "payment created with unsuccessful authorization",
-				slog.String("transaction_id", t.ID.String()),
-				slog.String("state", string(authorized.State)),
-				slog.Any("error", authErr))
-		}
-		return authorized, nil
-	}
+	// Returned immediately in the `created` state. The caller is not made to
+	// wait on a third party, and the outcome is discovered by polling the
+	// resource or, in a later phase, by a webhook.
+	return t, nil
+}
 
-	return nil, fmt.Errorf("authorize payment: %w", authErr)
+// AuthorizeRequested is the outbox payload that asks a worker to authorize.
+//
+// It carries identifiers rather than a snapshot of the transaction, so a message
+// that waited in a retry tier acts on current state rather than on what was true
+// when it was queued.
+type AuthorizeRequested struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	MerchantID    string    `json:"merchant_id"`
 }
 
 // Get returns a payment belonging to the given merchant.

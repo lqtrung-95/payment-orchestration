@@ -137,7 +137,7 @@ func Load() (*Config, error) {
 		},
 
 		PSP: PSP{
-			SimulatorURL:    l.str("PSP_SIMULATOR_URL", "http://localhost:9090"),
+			SimulatorURL:    l.str("PSP_SIMULATOR_URL", "http://localhost:9091"),
 			DefaultProvider: l.str("PSP_DEFAULT_PROVIDER", "psp-sync-sim"),
 			Timeout:         l.duration("PSP_TIMEOUT", 5*time.Second),
 		},

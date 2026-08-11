@@ -57,6 +57,9 @@ build: ## Build binaries into bin/
 	@mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/orchestrator ./cmd/orchestrator
 	go build -o $(BIN_DIR)/migrate ./cmd/migrate
+	go build -o $(BIN_DIR)/worker ./cmd/worker
+	go build -o $(BIN_DIR)/pspsim ./cmd/pspsim
+	go build -o $(BIN_DIR)/dlqctl ./cmd/dlqctl
 
 .PHONY: run
 run: ## Run the orchestrator against the local stack
@@ -64,7 +67,15 @@ run: ## Run the orchestrator against the local stack
 
 # --- Provider simulator ----------------------------------------------------
 
-PSPSIM_URL ?= http://localhost:9090
+PSPSIM_URL ?= http://localhost:9091
+
+.PHONY: worker
+worker: ## Run the payment worker (consumes Kafka, calls providers)
+	go run ./cmd/worker
+
+.PHONY: dlq
+dlq: ## List dead-lettered payment messages
+	go run ./cmd/dlqctl list
 
 .PHONY: pspsim
 pspsim: ## Run the fault-injecting provider simulator (separate process)

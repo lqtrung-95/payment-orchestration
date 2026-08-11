@@ -1,0 +1,65 @@
+package messaging
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+// HeaderEventID carries the outbox event id through the broker so a consumer
+// can deduplicate without parsing the payload.
+const HeaderEventID = "event-id"
+
+// HeaderAttempt carries how many times this message has already been tried,
+// which is what selects the next rung of the retry ladder.
+const HeaderAttempt = "retry-attempt"
+
+// Producer publishes to Kafka.
+type Producer struct {
+	client *kgo.Client
+}
+
+func NewProducer(client *kgo.Client) *Producer { return &Producer{client: client} }
+
+// Publish sends a message and waits for the broker to acknowledge it.
+//
+// Synchronous on purpose. The outbox marks a row published only once this
+// returns, so an asynchronous produce would let the row be marked while the
+// message was still in a buffer that a crash would discard — which is precisely
+// the lost-event case the outbox exists to prevent.
+func (p *Producer) Publish(ctx context.Context, topic, partitionKey, eventID string, payload []byte) error {
+	return p.PublishWithHeaders(ctx, topic, partitionKey, eventID, payload, nil)
+}
+
+// PublishWithHeaders is Publish with extra headers, used by the retry ladder to
+// carry the attempt count forward.
+func (p *Producer) PublishWithHeaders(
+	ctx context.Context,
+	topic, partitionKey, eventID string,
+	payload []byte,
+	extra map[string]string,
+) error {
+	headers := []kgo.RecordHeader{{Key: HeaderEventID, Value: []byte(eventID)}}
+	for k, v := range extra {
+		headers = append(headers, kgo.RecordHeader{Key: k, Value: []byte(v)})
+	}
+
+	record := &kgo.Record{
+		Topic: topic,
+		// The key determines the partition. Keying by merchant is what makes
+		// every event for one merchant land on one partition, and therefore
+		// ordered relative to the others.
+		Key:     []byte(partitionKey),
+		Value:   payload,
+		Headers: headers,
+	}
+
+	if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		return fmt.Errorf("publish to %s: %w", topic, err)
+	}
+	return nil
+}
+
+// Close flushes any buffered records.
+func (p *Producer) Close() { p.client.Close() }

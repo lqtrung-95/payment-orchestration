@@ -1,6 +1,6 @@
 # Phase 04 — Transactional Outbox, Kafka, Retry, DLQ
 
-**Priority:** P0 · **Status:** Not started · **Weeks:** 6–7
+**Priority:** P0 · **Status:** Complete · **Weeks:** 6–7
 
 The async backbone. This is the phase that reads as "distributed systems" on a resume — the JD names *distributed, cache, message* mechanisms explicitly.
 
@@ -81,16 +81,65 @@ Blindly retrying everything is the most common naive answer — the differentiat
 
 ## Todo
 
-- [ ] Outbox table + transactional writer
-- [ ] Publisher with `SKIP LOCKED` claim loop
-- [ ] Kafka topics + partitioning by merchant
-- [ ] Consumer group, manual offset commit
-- [ ] Idempotent handler wrapper + processed-event table
-- [ ] Backoff with full jitter
-- [ ] Tiered retry topics + DLQ
-- [ ] `dlqctl` inspect/replay
-- [ ] Per-PSP circuit breaker
-- [ ] Crash test suite (publisher / consumer / broker)
+- [x] Outbox table + transactional writer
+- [x] Publisher with lease-based `SKIP LOCKED` claim loop
+- [x] Kafka topics + partitioning by merchant
+- [x] Consumer group, manual offset commit
+- [x] Idempotent handler + processed-event table
+- [x] Backoff with full jitter
+- [x] Tiered retry topics + DLQ
+- [x] `dlqctl` inspect/replay
+- [x] Per-PSP circuit breaker
+- [ ] Crash test suite — partially covered; see below
+
+## Verified on 2026-08-11
+
+ADR [0007](../../docs/adr/0007-transactional-outbox-and-error-aware-retries.md).
+
+**Atomicity** — a rolled-back domain write leaves no outbox message; a committed
+one leaves exactly one. This is the property the whole pattern exists for.
+
+**No duplicate publishes** — four concurrent publishers over 120 messages
+deliver each exactly once. This test caught a real bug: the original claim used
+`FOR UPDATE SKIP LOCKED` alone, but the locks are released when the claim
+transaction commits, and publishing happens after that — so every publisher
+re-sent the same batch (259 sends for 120 messages). Fixed by claiming with a
+lease.
+
+**Retry policy** — declines, insufficient funds, do-not-honor, suspected fraud,
+and invalid instrument are all non-retryable, asserted per class. Ambiguous
+failures all require a status check before any retry. A test asserts every class
+in the taxonomy has an explicit policy, so adding one without deciding its
+policy fails the build.
+
+**Full jitter** — 500 draws produce >100 distinct delays, all under the ceiling.
+
+**Circuit breaker** — opens on consecutive failures, a success clears the
+streak, half-open admits only its configured probes, one failed probe reopens.
+Race-tested under 50 goroutines.
+
+**End to end over real Kafka** — create → outbox → relay → Kafka → worker →
+authorized. Isolated topics and consumer group per run. Covers: happy path,
+decline not retried (zero provider charges, zero retry-tier messages),
+timeout-after-success producing exactly one charge, duplicate delivery not
+processed twice, and exhausted retries landing in the DLQ without the
+transaction being marked failed.
+
+**Manual demo** — `POST /v1/payments` returned in **55ms** in the `created`
+state without waiting on the provider; the worker drove it to `authorized`.
+Outbox row `published`, dedup row written, decline produced no retries,
+`dlqctl` reports an empty queue and refuses replay without `--actor`/`--reason`.
+
+## Deferred
+
+- **Crash tests are partial.** Publisher-crash recovery is covered by the lease
+  (a dead publisher's rows become claimable again) and consumer redelivery by
+  the dedup test, but killing the broker mid-flight is not yet automated.
+- **Capture and refund topics** are not created — neither operation has an HTTP
+  surface yet, so a topic for them would carry nothing.
+- **Consumer lag is not exported.** A message stuck in a retry tier is currently
+  invisible without inspecting Kafka by hand; the observability phase fixes this.
+- **`processed_events` grows unbounded** — it needs a pruning job.
 
 ## Success criteria
 

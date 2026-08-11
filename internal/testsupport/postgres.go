@@ -74,6 +74,8 @@ func Truncate(t *testing.T, db *postgres.DB) {
 			postings,
 			journal_entries,
 			idempotency_keys,
+			outbox,
+			processed_events,
 			payment_transactions,
 			ledger_accounts
 		RESTART IDENTITY CASCADE`

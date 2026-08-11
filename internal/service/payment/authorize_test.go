@@ -14,6 +14,8 @@ import (
 
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
 	domain "github.com/lequoctrung/payment-orchestrator/internal/domain/transaction"
+	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp/simclient"
@@ -62,7 +64,7 @@ func newHarness(t *testing.T, mode string, faults map[simulator.Fault]float64) *
 
 	return &harness{
 		db:      db,
-		service: payment.NewService(db, txstore.NewRepository(), psp.NewRegistry("psp-test", adapter), logger),
+		service: payment.NewService(db, txstore.NewRepository(), psp.NewRegistry("psp-test", adapter), outbox.NewWriter(), messaging.DefaultTopics(), logger),
 		store:   store,
 		engine:  engine,
 		sim:     sim,
@@ -109,10 +111,17 @@ func containsSubstring(values []string, want string) bool {
 	return false
 }
 
+// create records a payment and then drives its authorization.
+//
+// Create only enqueues now — authorization happens in a worker consuming the
+// outbox. These tests are about what Authorize does when a provider misbehaves,
+// so they call it directly rather than standing up a consumer to deliver the
+// message. The queueing path has its own tests.
 func (h *harness) create(t *testing.T, key string, amountMinor int64) *domain.Transaction {
 	t.Helper()
+	ctx := context.Background()
 
-	tx, err := h.service.Create(context.Background(), payment.CreateInput{
+	tx, err := h.service.Create(ctx, payment.CreateInput{
 		MerchantID:     "m_test",
 		IdempotencyKey: key,
 		Amount:         money.MustNew(amountMinor, "USD"),
@@ -120,6 +129,11 @@ func (h *harness) create(t *testing.T, key string, amountMinor int64) *domain.Tr
 	})
 	if err != nil {
 		t.Fatalf("Create returned error: %v", err)
+	}
+
+	authorized, _ := h.service.Authorize(ctx, tx.ID)
+	if authorized != nil {
+		return authorized
 	}
 	return tx
 }
@@ -235,15 +249,7 @@ func TestUnresolvableOutcomeNeverMarksTransactionFailed(t *testing.T) {
 	// Now kill the provider and try a second, independent payment.
 	h.sim.Close()
 
-	second, err := h.service.Create(context.Background(), payment.CreateInput{
-		MerchantID:     "m_test",
-		IdempotencyKey: "key-provider-dead",
-		Amount:         money.MustNew(6600, "USD"),
-		Actor:          "test",
-	})
-	if err != nil {
-		t.Fatalf("Create returned error: %v", err)
-	}
+	second := h.create(t, "key-provider-dead", 6600)
 
 	if second.State == domain.StateFailed {
 		t.Error("a dead provider must not produce a failed transaction — the outcome is unknown")
