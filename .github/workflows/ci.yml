@@ -88,6 +88,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - uses: golangci/golangci-lint-action@v6
+      # v7 or later is required: earlier action releases reject a golangci-lint
+      # v2 version string outright, since v2 changed the config schema.
+      - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
