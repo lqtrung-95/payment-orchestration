@@ -16,6 +16,8 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/redis"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/telemetry"
+	"github.com/lequoctrung/payment-orchestrator/internal/psp"
+	"github.com/lequoctrung/payment-orchestrator/internal/psp/simclient"
 	"github.com/lequoctrung/payment-orchestrator/internal/service/payment"
 	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
@@ -75,7 +77,33 @@ func run() error {
 	// while its owner is still working. Record TTL matches the 24h window
 	// providers conventionally honour for key reuse.
 	idempotencyRepo := idempotency.NewRepository(cfg.HTTP.RequestTimeout*2, 24*time.Hour)
-	paymentService := payment.NewService(db, txstore.NewRepository())
+
+	// Three providers with deliberately different shapes, all served by one
+	// simulator process. Two adapters with identical semantics would prove
+	// nothing; the differences are what force real orchestration rather than a
+	// passthrough.
+	providers := psp.NewRegistry(cfg.PSP.DefaultProvider,
+		simclient.New(simclient.Config{
+			Name: "psp-sync-sim", BaseURL: cfg.PSP.SimulatorURL,
+			Mode: simclient.ModeSync, Timeout: cfg.PSP.Timeout,
+		}),
+		simclient.New(simclient.Config{
+			Name: "psp-async-sim", BaseURL: cfg.PSP.SimulatorURL,
+			Mode: simclient.ModeAsync, Timeout: cfg.PSP.Timeout,
+		}),
+		simclient.New(simclient.Config{
+			Name: "psp-redirect-sim", BaseURL: cfg.PSP.SimulatorURL,
+			Mode: simclient.ModeRedirect, Timeout: cfg.PSP.Timeout,
+		}),
+	)
+	if _, err := providers.Default(); err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "payment providers registered",
+		slog.Any("providers", providers.Names()),
+		slog.String("default", cfg.PSP.DefaultProvider))
+
+	paymentService := payment.NewService(db, txstore.NewRepository(), providers, logger)
 
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,

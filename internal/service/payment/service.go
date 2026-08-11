@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -21,18 +22,21 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
 	domain "github.com/lequoctrung/payment-orchestrator/internal/domain/transaction"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
+	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
 )
 
 var ErrNotFound = errors.New("payment not found")
 
 type Service struct {
-	db     *postgres.DB
-	txRepo *txstore.Repository
+	db        *postgres.DB
+	txRepo    *txstore.Repository
+	providers *psp.Registry
+	logger    *slog.Logger
 }
 
-func NewService(db *postgres.DB, txRepo *txstore.Repository) *Service {
-	return &Service{db: db, txRepo: txRepo}
+func NewService(db *postgres.DB, txRepo *txstore.Repository, providers *psp.Registry, logger *slog.Logger) *Service {
+	return &Service{db: db, txRepo: txRepo, providers: providers, logger: logger}
 }
 
 type CreateInput struct {
@@ -73,7 +77,26 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*domain.Transacti
 		return nil, fmt.Errorf("create payment: %w", err)
 	}
 
-	return t, nil
+	// Authorization runs inline for now. A later phase moves it behind the
+	// transactional outbox, at which point this call becomes an enqueue and the
+	// request stops waiting on a third party.
+	//
+	// A provider decline is not a request failure: the payment resource exists
+	// and its state carries the outcome. Authorize returns the transaction
+	// alongside any provider error and returns nil only when something
+	// infrastructural broke, so a non-nil transaction is the answer.
+	authorized, authErr := s.Authorize(ctx, t.ID)
+	if authorized != nil {
+		if authErr != nil {
+			s.logger.InfoContext(ctx, "payment created with unsuccessful authorization",
+				slog.String("transaction_id", t.ID.String()),
+				slog.String("state", string(authorized.State)),
+				slog.Any("error", authErr))
+		}
+		return authorized, nil
+	}
+
+	return nil, fmt.Errorf("authorize payment: %w", authErr)
 }
 
 // Get returns a payment belonging to the given merchant.

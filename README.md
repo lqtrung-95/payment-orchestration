@@ -10,9 +10,10 @@ times, out of order, before the API call that created the transaction returned.
 A settlement file that disagrees with your ledger by three cents. The happy path
 is a CRUD app; the failure paths are the actual problem.
 
-> **Status: in progress — 2 of 10 phases complete.**
-> The transaction core is built and tested: ledger, state machine, idempotency.
-> Provider integration, webhooks, queueing, and reconciliation are not built yet.
+> **Status: in progress — 3 of 10 phases complete.**
+> Built and tested: ledger, state machine, idempotency, provider abstraction, and
+> a provider simulator that fails on purpose.
+> Webhook ingestion, queueing, and reconciliation are not built yet.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -37,6 +38,7 @@ the four places that write this table."
 | Illegal state transitions | Trigger against a transition table **+** Go aggregate | No |
 | One key ⇒ one execution | `UNIQUE (merchant_id, key)` inside a committed tx | No |
 | Concurrent writers can't clobber | `version` column, optimistic lock | No |
+| A payment is never failed on an unknown outcome | `GetStatus` recovery; unresolved stays non-terminal | No |
 
 Three of these deserve explanation.
 
@@ -74,21 +76,69 @@ constructor anywhere in the codebase. Proportional amounts (fees, splits) go
 through an allocation that distributes the truncation remainder, so parts always
 sum back to the original exactly.
 
+## Failure handling
+
+A provider call can fail in a way that says nothing about whether the money
+moved: the charge is recorded and the response is lost. Retrying charges twice.
+Marking it failed writes off money the customer actually paid. Every provider
+error is normalized into one of three categories, each with a different answer:
+
+| Category | Examples | Response |
+|---|---|---|
+| **Terminal** | declined, insufficient funds, suspected fraud | Fail it. Never retry. |
+| **Retryable** | rate limited, provider unavailable | Leave open. Nothing happened. |
+| **Ambiguous** | timeout, network error, **HTTP 500** | Ask `GetStatus`. Never retry blind. |
+
+A 500 is ambiguous, not a failure — the provider may have recorded the charge
+and then fallen over while replying. An unrecognised error also defaults to
+ambiguous, because guessing "it failed" is how a real payment gets lost.
+
+When nothing can be established — the provider is unreachable, or its status
+endpoint lags — the transaction stays **non-terminal** and says so. A false
+"authorized" is recoverable by reconciliation; a false "failed" is money quietly
+gone. See [ADR 0006](docs/adr/0006-ambiguous-provider-outcomes-are-resolved-not-guessed.md).
+
+### The provider misbehaves on purpose
+
+`cmd/pspsim` is a separate process implementing a deliberately unreliable
+provider. Faults are tunable at runtime — the demo is toggling them while
+traffic flows — and every verdict is derived from a seed plus the request
+identity, so a chaos run replays exactly rather than approximately.
+
+| Fault | What it forces |
+|---|---|
+| `timeout_after_success` | Charge recorded, connection hangs. The flagship case. |
+| `error_5xx_after_success` | Same, wearing an HTTP status code |
+| `duplicate_webhook` | Deduplication (Phase 05) |
+| `out_of_order_webhook` | State guards on stale events (Phase 05) |
+| `webhook_before_response` | Webhook arriving before the API reply (Phase 05) |
+| `slow_response` | Timeout budgets |
+| `partial_capture_drift` | A reconciliation break, not an error |
+| `stale_status` | Recovery cannot assume the provider is read-consistent |
+
+Three provider shapes, deliberately not interchangeable: synchronous,
+asynchronous (resolves only by webhook), and redirect-based (3-D Secure style).
+Two adapters with identical semantics would prove nothing.
+
+Declines are triggered by magic amounts, the way real sandboxes work — the last
+two digits are the actual ISO-8583 response code, so an amount ending in `51`
+declines for insufficient funds.
+
 ## Verified behaviour
 
-Measured on this repo, not projected. 56 tests, green in
+Measured on this repo, not projected. 81 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
 **Idempotency, end to end over HTTP** — 50 concurrent `POST /v1/payments`
-carrying one idempotency key:
+carrying one idempotency key, with a real provider call in the request path:
 
 ```
-42 × 201   (1 execution + 41 replays)
- 8 × 409   (in-flight, told to retry)
+41 × 201   (1 execution + 40 replays)
+ 9 × 409   (in-flight, told to retry)
 ------------------------------------
-transactions created: 1
-idempotency rows:     1
+transactions created:  1
+provider charges:      1
 ```
 
 Replays are **byte-identical** to the original response. Reformatted JSON — same
@@ -107,6 +157,19 @@ cross-currency posting rejected; `UPDATE`/`DELETE` on postings rejected. Invaria
 **Concurrency** — 20 concurrent writers on one transaction: version advances
 exactly once per winner, every loser gets a typed conflict error rather than
 silently losing its write.
+
+**Ambiguous-failure recovery** — with `timeout_after_success` forced to 100%,
+and again with `error_5xx_after_success` at 100%: the transaction reaches
+`authorized` with **exactly one charge** at the provider. The tests assert the
+audit trail contains *recovered after ambiguous failure*, so they cannot pass
+vacuously if the fault stops firing.
+
+**Nothing terminal without evidence** — provider outage, and the provider
+process killed outright mid-flow: the transaction stays `authorizing`, never
+`failed`. Only a genuine decline reaches a terminal state.
+
+**Reproducible chaos** — the same seed produces identical fault verdicts
+regardless of call order or concurrency; different seeds diverge.
 
 ## Try it
 
@@ -135,6 +198,14 @@ different amount and the same key, and you get a 409.
 
 Amounts are integer minor units. `{"amount":125.50}` is rejected at the boundary
 rather than truncated, and so is a typo like `"currrency"`.
+
+Run it against the misbehaving provider:
+
+```bash
+make pspsim        # separate process, so it can be killed mid-flow
+make chaos         # switch fault injection on while traffic flows
+make outage        # take the provider down for 30s
+```
 
 ```bash
 make test          # includes integration tests against the live stack
@@ -175,10 +246,12 @@ One service with enforced module boundaries, deliberately not microservices — 
 distributed monolith would be a worse design, not a better one, at this size.
 
 ```
-cmd/          orchestrator, migrate
+cmd/          orchestrator, migrate, pspsim
 internal/
   domain/     money, ledger, transaction   — no I/O, no framework types
   store/      repositories                  — take a Querier, so callers own the tx boundary
+  psp/        provider contract, error taxonomy, adapters
+  simulator/  the provider that fails on purpose
   service/    orchestration
   transport/  Hertz handlers + middleware
   platform/   postgres, redis, kafka, telemetry, sharding
@@ -214,9 +287,12 @@ Stated plainly, because a README that omits them is not worth reading.
   every row; routing across physical databases comes later. Storing it now is
   the point — backfilling a shard key across a populated ledger means rewriting
   every row while the service stays online.
-- **No load or chaos numbers yet.** They require the fault-injecting provider
-  simulator, which is the next phase. This README will not carry a throughput
-  figure until one has actually been measured.
+- **No throughput numbers yet.** Load testing is Phase 09. This README will not
+  carry a throughput figure until one has actually been measured.
+- **No Stripe adapter.** It needs a real Stripe account and key. The interface
+  and registry are built so it slots in without touching orchestration.
+- **Authorization runs inline** in the request. Phase 04 moves it behind the
+  transactional outbox so the caller stops waiting on a third party.
 
 ## Roadmap
 
@@ -224,8 +300,8 @@ Stated plainly, because a README that omits them is not worth reading.
 |---|---|---|
 | 01 | Service skeleton, config, migrations, CI | Done |
 | 02 | Ledger, transaction state machine, idempotency | Done |
-| 03 | PSP abstraction + deliberately misbehaving simulator | Next |
-| 04 | Transactional outbox → Kafka → retry ladder → DLQ | |
+| 03 | PSP abstraction + deliberately misbehaving simulator | Done |
+| 04 | Transactional outbox → Kafka → retry ladder → DLQ | Next |
 | 05 | Webhook ingest, dedup, out-of-order tolerance | |
 | 06 | Payment instrument binding + lifecycle | |
 | 07 | FX conversion + settlement reconciliation | |
@@ -233,6 +309,7 @@ Stated plainly, because a README that omits them is not worth reading.
 | 09 | OpenTelemetry, load + chaos testing | |
 | 10 | Architecture docs and demo | |
 
-Phase 03 is the one that matters most: a provider simulator that times out after
-succeeding, duplicates and reorders webhooks, and goes down mid-flow. Every
-correctness claim this project wants to make is untestable without it.
+Phase 04 moves authorization off the request path: a transactional outbox so the
+domain write and the queue write commit together, then a tiered retry ladder
+whose policy is driven by the error taxonomy above — because the one thing a
+retry must never do is repeat a decline or guess at an ambiguous outcome.

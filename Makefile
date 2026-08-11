@@ -62,6 +62,35 @@ build: ## Build binaries into bin/
 run: ## Run the orchestrator against the local stack
 	go run ./cmd/orchestrator
 
+# --- Provider simulator ----------------------------------------------------
+
+PSPSIM_URL ?= http://localhost:9090
+
+.PHONY: pspsim
+pspsim: ## Run the fault-injecting provider simulator (separate process)
+	go run ./cmd/pspsim
+
+.PHONY: faults
+faults: ## Show the simulator's current fault configuration
+	@curl -s $(PSPSIM_URL)/admin/faults
+
+.PHONY: healthy
+healthy: ## Switch the simulator to the healthy preset
+	@curl -s -X PUT "$(PSPSIM_URL)/admin/faults/preset?name=healthy" >/dev/null && echo "preset: healthy"
+
+.PHONY: degraded
+degraded: ## Switch the simulator to the degraded preset
+	@curl -s -X PUT "$(PSPSIM_URL)/admin/faults/preset?name=degraded" >/dev/null && echo "preset: degraded"
+
+.PHONY: chaos
+chaos: ## Switch the simulator to the chaos preset
+	@curl -s -X PUT "$(PSPSIM_URL)/admin/faults/preset?name=chaos" >/dev/null && echo "preset: chaos"
+
+.PHONY: outage
+outage: ## Take the simulated provider down (SECONDS=30)
+	@curl -s -X POST "$(PSPSIM_URL)/admin/outage?seconds=$(or $(SECONDS),30)" >/dev/null \
+		&& echo "provider down for $(or $(SECONDS),30)s"
+
 # --- Database --------------------------------------------------------------
 
 .PHONY: migrate-up

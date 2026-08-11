@@ -15,6 +15,23 @@ type Config struct {
 	Redis    Redis
 	Kafka    Kafka
 	Log      Log
+	PSP      PSP
+}
+
+type PSP struct {
+	// SimulatorURL is the fault-injecting provider simulator. It runs as its own
+	// process so it can be killed mid-flow.
+	SimulatorURL string
+
+	// DefaultProvider names the adapter used when a transaction does not pick
+	// one. Routing rules arrive in a later phase.
+	DefaultProvider string
+
+	// Timeout bounds a single provider call. It is deliberately short relative
+	// to the HTTP request timeout: a hung provider must surface as a timeout
+	// this service classifies and recovers from, not as the caller giving up
+	// first and leaving the outcome unexamined.
+	Timeout time.Duration
 }
 
 type HTTP struct {
@@ -117,6 +134,12 @@ func Load() (*Config, error) {
 			Level:     l.oneOf("LOG_LEVEL", "info", "debug", "info", "warn", "error"),
 			Format:    l.oneOf("LOG_FORMAT", "json", "json", "text"),
 			AddSource: l.bool("LOG_ADD_SOURCE", false),
+		},
+
+		PSP: PSP{
+			SimulatorURL:    l.str("PSP_SIMULATOR_URL", "http://localhost:9090"),
+			DefaultProvider: l.str("PSP_DEFAULT_PROVIDER", "psp-sync-sim"),
+			Timeout:         l.duration("PSP_TIMEOUT", 5*time.Second),
 		},
 	}
 

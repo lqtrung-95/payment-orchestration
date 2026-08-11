@@ -1,6 +1,6 @@
 # Phase 03 — PSP Abstraction + Fault-Injecting Simulator
 
-**Priority:** P0 · **Status:** Not started · **Week:** 5
+**Priority:** P0 · **Status:** Complete · **Week:** 5
 
 The centerpiece, not a test fixture. Every impressive claim this project makes comes from things going wrong on purpose.
 
@@ -70,14 +70,58 @@ The centerpiece, not a test fixture. Every impressive claim this project makes c
 
 ## Todo
 
-- [ ] `PSPAdapter` interface + normalized error taxonomy
-- [ ] `pspsim` standalone service
-- [ ] Seeded, live-reloadable fault engine
-- [ ] Four providers with distinct semantics
-- [ ] Webhook emitter with delay/duplicate/reorder
-- [ ] Per-PSP idempotency key handling
-- [ ] Admin fault control API + presets
-- [ ] Integration test per fault mode
+- [x] `PSPAdapter` interface + normalized error taxonomy
+- [x] `pspsim` standalone service
+- [x] Seeded, live-reloadable fault engine
+- [x] Three simulated providers with distinct semantics (Stripe deferred — see below)
+- [x] Webhook emitter with delay/duplicate/reorder
+- [x] Per-PSP idempotency key handling
+- [x] Admin fault control API + presets
+- [x] Integration test per fault mode
+
+## Verified on 2026-08-11
+
+ADR [0006](../../docs/adr/0006-ambiguous-provider-outcomes-are-resolved-not-guessed.md).
+
+**Recovery, the flagship claim** — `timeout_after_success` and
+`error_5xx_after_success` each forced to 100%: transaction reaches `authorized`
+with **exactly one charge** at the provider. Tests assert the audit trail
+contains *recovered after ambiguous failure*, so the assertion cannot pass
+vacuously if the fault silently stops firing.
+
+**Nothing terminal without evidence** — provider outage, and provider process
+killed outright mid-flow: transaction stays `authorizing`, never `failed`. Only
+a genuine decline reaches a terminal state.
+
+**Error taxonomy** — partition test proves every class is exactly one of
+terminal / retryable / ambiguous. 5xx and unrecognised errors both classify as
+ambiguous, not failure.
+
+**Determinism** — same seed replays identically regardless of call order or
+concurrency; different seeds diverge. Fault verdicts are derived per
+attempt rather than per key, so a retry can escape a fault that fired once.
+
+**Provider shapes** — sync returns authorized; async returns pending and parks
+the transaction until a webhook resolves it; redirect returns requires_action
+with a URL. Duplicate and out-of-order webhook faults verified at the emitter.
+
+**Demo, end to end** — `make pspsim` + `make run`, then `make chaos`,
+`make outage`, or killing the simulator; audit trail shows
+`authorizing -> authorized (recovered after ambiguous failure)`.
+
+## Deferred
+
+- **Stripe sandbox adapter.** Needs a real Stripe account and API key. The
+  `psp.Adapter` interface and registry are built so it slots in without touching
+  orchestration; simulators remain the primary test surface, per this phase's own
+  risk note.
+- **End-to-end webhook faults.** `duplicate_webhook`, `out_of_order_webhook`, and
+  `webhook_before_response` are implemented and tested at the emitter, but there
+  is no ingestion endpoint until Phase 05, where they get proven end to end.
+- **Capture and refund have no HTTP surface** yet, though both paths exist on the
+  adapter and aggregate.
+- **Authorization runs inline** in the request. Phase 04 moves it behind the
+  transactional outbox.
 
 ## Success criteria
 
