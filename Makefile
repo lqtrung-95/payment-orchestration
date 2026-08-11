@@ -34,13 +34,16 @@ vet: ## Run go vet
 lint: ## Run golangci-lint
 	golangci-lint run ./...
 
+# -p 1 runs one package at a time. Integration tests share a single database and
+# truncate it between cases, so packages running concurrently would wipe each
+# other's fixtures mid-test.
 .PHONY: test
 test: ## Run tests with race detection
-	go test -race -count=1 ./...
+	go test -race -count=1 -p 1 ./...
 
 .PHONY: cover
 cover: ## Run tests and open an HTML coverage report
-	go test -race -count=1 -coverprofile=coverage.out ./...
+	go test -race -count=1 -p 1 -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "coverage report: coverage.html"
 

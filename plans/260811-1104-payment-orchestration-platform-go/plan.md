@@ -23,7 +23,7 @@ CloudWeGo is ByteDance's own open-source Go stack — using it is a deliberate s
 | # | Phase | Weeks | Status |
 |---|-------|-------|--------|
 | 01 | [Go ramp + service skeleton](phase-01-go-ramp-and-service-skeleton.md) | 1–2 | Scaffold done, ramp ongoing |
-| 02 | [Ledger, state machine, idempotency](phase-02-ledger-state-machine-idempotency.md) | 3–4 | Not started |
+| 02 | [Ledger, state machine, idempotency](phase-02-ledger-state-machine-idempotency.md) | 3–4 | **Complete** |
 | 03 | [PSP abstraction + chaos simulator](phase-03-psp-abstraction-and-chaos-simulator.md) | 5 | Not started |
 | 04 | [Outbox, Kafka, retry, DLQ](phase-04-outbox-kafka-retry-dlq.md) | 6–7 | Not started |
 | 05 | [Webhook ingestion + dedup](phase-05-webhook-ingestion-and-dedup.md) | 8 | Not started |

@@ -1,6 +1,6 @@
 # Phase 02 — Ledger, Transaction State Machine, Idempotency
 
-**Priority:** P0 — the spine · **Status:** Not started · **Weeks:** 3–4
+**Priority:** P0 — the spine · **Status:** Complete · **Weeks:** 3–4
 
 The three things that cannot be retrofitted. Everything else in the project is additive; get these wrong and you rebuild.
 
@@ -76,15 +76,53 @@ States: `in_flight` → `completed` | `failed`. Concurrent request on an `in_fli
 
 ## Todo
 
-- [ ] `Money` type + property tests
-- [ ] Ledger schema, repo, balance-per-entry enforcement
-- [ ] Invariant checker
-- [ ] Transaction aggregate + enforced state machine
-- [ ] Append-only state audit
-- [ ] Idempotency middleware covering all four races
-- [ ] `POST /payments` skeleton flow
-- [ ] Concurrency test suite
-- [ ] ADRs: money, shard key, idempotency
+- [x] `Money` type + property tests
+- [x] Ledger schema, repo, balance-per-entry enforcement
+- [x] Invariant checker
+- [x] Transaction aggregate + enforced state machine
+- [x] Append-only state audit
+- [x] Idempotency middleware covering all four races
+- [x] `POST /payments` skeleton flow
+- [x] Concurrency test suite
+- [x] ADRs: money, ledger, shard key, idempotency, transition matrix
+
+## Verified on 2026-08-11
+
+Migrations `000002`–`000004`; ADRs [0001](../../docs/adr/0001-money-as-integer-minor-units.md)–[0005](../../docs/adr/0005-transition-matrix-enforced-in-two-places.md).
+
+**Money** — 20,000-case property test: allocation never creates or destroys a
+minor unit, for any amount and any ratios. Split parts differ by at most one
+unit. Overflow detected on add, subtract, negate, multiply, and inside
+allocation. Decimal amounts rejected at the JSON boundary.
+
+**Ledger** — unbalanced entry rejected at COMMIT by the deferred constraint
+trigger; entry with no postings rejected; cross-currency posting rejected by the
+composite foreign key; `UPDATE`/`DELETE` on postings rejected. Balances derived
+and oriented by account type. Invariant holds across a 25-entry three-way fee
+split.
+
+**Transactions** — Go and SQL transition matrices proven identical by test.
+Illegal transitions rejected in both. `captured <= amount` and
+`refunded <= captured` enforced as CHECK constraints. 20 concurrent writers:
+version advances exactly once per winner, losers get `ErrVersionConflict`.
+Audit trail append-only.
+
+**Idempotency** — all four races covered. Stale claim taken over *and* the
+displaced owner fenced out by claim token. Keys scoped per merchant. 100
+concurrent claims → exactly one winner.
+
+**End to end over HTTP** — 50 concurrent `POST /v1/payments` with one key → 1
+transaction, 1 key row (42×201, 8×409 in-flight). Replay byte-identical.
+Reformatted JSON still replays. Key reuse with a different body → 409. Another
+merchant reading the payment → 404. Ledger balanced.
+
+## Deferred to a later phase
+
+- **No authentication.** `X-Merchant-Id` is an unauthenticated header — any
+  caller can claim to be any merchant. Must be replaced before this is exposed.
+- **No expiry reaper** for idempotency records; the table grows unbounded.
+- Capture and refund exist on the aggregate but have no HTTP surface, since
+  both need a provider.
 
 ## Success criteria
 

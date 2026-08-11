@@ -54,15 +54,18 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Migrations must exist before the integration tests run.
+      - name: Apply migrations
+        run: go run ./cmd/migrate up
+
+      # -p 1 runs one package at a time: integration tests share a database and
+      # truncate between cases, so concurrent packages would wipe each other.
       - name: Test
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: go test -race -count=1 -p 1 -coverprofile=coverage.out ./...
 
       # Migrations are exercised in both directions. An up-only check passes
       # happily with an unusable down migration, which is exactly what you need
       # when a deploy has to be rolled back.
-      - name: Apply migrations
-        run: go run ./cmd/migrate up
-
       - name: Revert and re-apply migrations
         run: |
           go run ./cmd/migrate down

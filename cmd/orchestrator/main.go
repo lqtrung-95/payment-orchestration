@@ -9,12 +9,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/kafka"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/redis"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/telemetry"
+	"github.com/lequoctrung/payment-orchestrator/internal/service/payment"
+	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
+	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
 	transport "github.com/lequoctrung/payment-orchestrator/internal/transport/http"
 	"github.com/lequoctrung/payment-orchestrator/internal/transport/http/handler"
 )
@@ -67,13 +71,22 @@ func run() error {
 	defer kfk.Close()
 	logger.InfoContext(ctx, "connected to kafka", slog.Any("brokers", cfg.Kafka.Brokers))
 
+	// Lock TTL exceeds the HTTP request timeout so a claim is never taken over
+	// while its owner is still working. Record TTL matches the 24h window
+	// providers conventionally honour for key reuse.
+	idempotencyRepo := idempotency.NewRepository(cfg.HTTP.RequestTimeout*2, 24*time.Hour)
+	paymentService := payment.NewService(db, txstore.NewRepository())
+
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,
+		DB:     db,
 		Health: []handler.NamedChecker{
 			{Name: "postgres", Checker: db},
 			{Name: "redis", Checker: rdb},
 			{Name: "kafka", Checker: kfk},
 		},
+		PaymentService:  paymentService,
+		IdempotencyRepo: idempotencyRepo,
 	})
 
 	errCh := make(chan error, 1)
