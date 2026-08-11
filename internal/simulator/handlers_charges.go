@@ -72,12 +72,31 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// disagree about what happened.
 	if created && mode == ModeAsync {
 		reference := charge.Reference
-		//nolint:contextcheck // resolution must outlive the triggering request
-		s.hooks.Background(func() {
-			time.Sleep(s.engine.WebhookDelay())
+		// Delivery is bounded by its own deadline rather than the request's: a
+		// webhook is the provider's own action, and cancelling it because the
+		// API call returned would mean an async charge never resolves.
+		//nolint:contextcheck // provider follow-up must outlive the request
+		resolve := func() {
 			s.store.SetStatus(reference, simAuthorized)
 			s.hooks.Emit(reference, key, simAuthorized, s.engine)
-		})
+		}
+
+		// The callback and the HTTP reply are sent concurrently by a real
+		// provider, and the callback sometimes wins. Delivering it before
+		// answering reproduces that exactly: the receiver is told about a charge
+		// whose reference it has not yet been given, and must not invent a
+		// payment to attach it to.
+		if s.engine.Fires(FaultWebhookBeforeResponse, faultKey(key, s.store.CurrentAttempt(key))) {
+			s.logger.WarnContext(r.Context(), "delivering webhook before the response",
+				slog.String("key", key), slog.String("reference", reference))
+			resolve()
+		} else {
+			//nolint:contextcheck // resolution must outlive the triggering request
+			s.hooks.Background(func() {
+				time.Sleep(s.engine.WebhookDelay())
+				resolve()
+			})
+		}
 	}
 
 	if s.applyPostSuccessFaults(w, r, key, created) {

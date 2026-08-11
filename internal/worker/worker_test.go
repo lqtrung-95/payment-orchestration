@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/lequoctrung/payment-orchestrator/internal/config"
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
 	domain "github.com/lequoctrung/payment-orchestrator/internal/domain/transaction"
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
@@ -26,6 +29,9 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/simulator"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
 	"github.com/lequoctrung/payment-orchestrator/internal/testsupport"
+	transport "github.com/lequoctrung/payment-orchestrator/internal/transport/http"
+	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
+	webhookproviders "github.com/lequoctrung/payment-orchestrator/internal/webhook/providers"
 	"github.com/lequoctrung/payment-orchestrator/internal/worker"
 )
 
@@ -34,19 +40,43 @@ type pipeline struct {
 	service *payment.Service
 	store   *simulator.Store
 	engine  *simulator.Engine
+	events  *webhook.Repository
+	proc    *webhook.Processor
+	hooks   *simulator.WebhookEmitter
 	topics  messaging.Topics
 	brokers []string
 	sim     *httptest.Server
 	cancel  context.CancelFunc
 }
 
+// pipelineOpts selects which provider shape the pipeline talks to.
+type pipelineOpts struct {
+	// mode picks the adapter. The async provider is the one that makes webhooks
+	// load-bearing: it answers "pending" and the outcome only ever arrives as a
+	// callback, so a transaction stays parked until one lands.
+	mode   string
+	faults map[simulator.Fault]float64
+
+	// topics overrides the generated set, for tests that need a specific retry
+	// delay rather than the collapsed one.
+	topics *messaging.Topics
+}
+
+const webhookSecret = "test-webhook-secret"
+
 // newPipeline stands up the whole asynchronous path against real infrastructure:
-// a real database, real Kafka, and a provider that misbehaves on request.
+// a real database, real Kafka, a real HTTP ingest endpoint, and a provider that
+// misbehaves on request.
 //
 // Every run gets its own topics and consumer group. Sharing fixed names across
 // runs would make each test see the previous run's backlog, which turns real
 // failures into noise and hides genuine ones.
 func newPipeline(t *testing.T, faults map[simulator.Fault]float64) *pipeline {
+	t.Helper()
+	return newPipelineWith(t, pipelineOpts{mode: simclient.ModeSync, faults: faults})
+}
+
+func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	t.Helper()
 
 	brokers := kafkaBrokers(t)
@@ -54,19 +84,19 @@ func newPipeline(t *testing.T, faults map[simulator.Fault]float64) *pipeline {
 	logger := testLogger()
 
 	cfg, _ := simulator.Preset(simulator.PresetHealthy, 20260811)
-	for f, p := range faults {
+	for f, p := range opts.faults {
 		cfg.Probabilities[f] = p
 	}
 	store := simulator.NewStore()
 	engine := simulator.NewEngine(cfg)
-	hooks := simulator.NewWebhookEmitter("", "test-secret", logger)
-	sim := httptest.NewServer(simulator.NewServer(store, engine, hooks, logger))
-	t.Cleanup(sim.Close)
 
 	run := strings.ReplaceAll(uuid.NewString()[:8], "-", "")
 	// Retry delays are collapsed: the routing decision is what is under test,
 	// not the wall-clock wait, and a test cannot sit through the real ladder.
 	topics := messaging.PrefixedTopics("test-"+run+".", 200*time.Millisecond)
+	if opts.topics != nil {
+		topics = *opts.topics
+	}
 	group := "test-workers-" + run
 
 	producerClient, err := kgo.NewClient(
@@ -88,9 +118,20 @@ func newPipeline(t *testing.T, faults map[simulator.Fault]float64) *pipeline {
 	}
 	producer := messaging.NewProducer(producerClient)
 
+	// The ingest endpoint is stood up before the provider, because the provider
+	// has to be told where to deliver callbacks when it is constructed.
+	registry := webhook.NewRegistry(webhookproviders.NewSimulator(testProvider, webhookSecret))
+	events := webhook.NewRepository()
+	ingestor := webhook.NewIngestor(db, registry, events, outbox.NewWriter(), topics, logger)
+	ingestURL := startIngestServer(t, ingestor, logger)
+
+	hooks := simulator.NewWebhookEmitter(ingestURL, webhookSecret, logger)
+	sim := httptest.NewServer(simulator.NewServer(store, engine, hooks, logger))
+	t.Cleanup(sim.Close)
+
 	adapter := simclient.New(simclient.Config{
 		Name: "psp-test", BaseURL: sim.URL,
-		Mode: simclient.ModeSync, Timeout: 300 * time.Millisecond,
+		Mode: opts.mode, Timeout: 300 * time.Millisecond,
 	})
 	service := payment.NewService(db, txstore.NewRepository(),
 		psp.NewRegistry("psp-test", adapter), outbox.NewWriter(), topics, logger)
@@ -98,24 +139,97 @@ func newPipeline(t *testing.T, faults map[simulator.Fault]float64) *pipeline {
 	breakers := map[string]*resilience.CircuitBreaker{
 		"default": resilience.NewCircuitBreaker("psp-test", resilience.DefaultCircuitConfig()),
 	}
-	handler := worker.NewAuthorizeHandler(db, service, producer, topics,
-		worker.NewDedup(group), breakers, logger)
+	dedup := worker.NewDedup(group)
+	processor := webhook.NewProcessor(db, registry, events, txstore.NewRepository(), logger)
+
+	router := worker.NewRouter(db, producer, topics, dedup, logger)
+	router.Register(topics.Authorize,
+		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, logger).Handle)
+	router.Register(topics.Webhook,
+		worker.NewWebhookHandler(db, processor, producer, topics, dedup, logger).Handle)
 
 	consumer, err := messaging.NewConsumer(brokers, group, "test-consumer-"+run, topics.Consumed(), logger)
 	if err != nil {
 		t.Fatalf("kafka consumer: %v", err)
 	}
 	t.Cleanup(consumer.Close)
+	consumer = consumer.WithDue(topics.DueAt)
 
 	publisher := outbox.NewPublisher(db, producer, outbox.DefaultPublisherConfig(), logger)
 
 	go func() { _ = publisher.Run(ctx) }()
-	go func() { _ = consumer.Run(ctx, handler.Handle) }()
+	go func() { _ = consumer.Run(ctx, router.Handle) }()
 
 	return &pipeline{
 		db: db, service: service, store: store, engine: engine,
+		events: events, proc: processor, hooks: hooks,
 		topics: topics, brokers: brokers, sim: sim, cancel: cancel,
 	}
+}
+
+const testProvider = "psp-sim"
+
+// startIngestServer runs the real HTTP surface, not a stand-in.
+//
+// The status codes are part of the contract: a duplicate has to come back 200,
+// because a provider told anything else retries harder and turns its own
+// redelivery into a flood. Testing against a hand-rolled handler would assert
+// that the test agrees with itself.
+func startIngestServer(t *testing.T, ingestor *webhook.Ingestor, logger *slog.Logger) string {
+	t.Helper()
+
+	// Hertz binds an explicit address, so a free port is reserved and released.
+	// The gap is a race in principle; in practice nothing else on a test machine
+	// is racing for this particular port.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release port: %v", err)
+	}
+
+	cfg := &config.Config{HTTP: config.HTTP{
+		Addr: addr, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second,
+		IdleTimeout: 30 * time.Second, ShutdownTimeout: 2 * time.Second,
+		RequestTimeout: 5 * time.Second, MaxBodyBytes: 1 << 20,
+	}}
+
+	srv := transport.New(cfg, transport.Deps{Logger: logger, WebhookIngestor: ingestor})
+	// Run rather than Spin: Spin installs signal handlers, and a test process
+	// with several of them fighting over SIGINT is its own kind of flake.
+	go func() { _ = srv.Run() }()
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	})
+
+	url := "http://" + addr + "/webhooks/" + testProvider
+	waitForIngestServer(t, url)
+	return url
+}
+
+// waitForIngestServer blocks until the endpoint answers, so a test cannot race
+// the server's own startup and read the resulting connection refusal as a bug.
+func waitForIngestServer(t *testing.T, url string) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		// An unsigned POST is refused, which is exactly the proof wanted here:
+		// the route exists and the verifier is in front of it.
+		resp, err := http.Post(url, "application/json", strings.NewReader("{}")) //nolint:noctx // liveness probe
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("webhook ingest endpoint never became ready at %s", url)
 }
 
 // testLogger is silent unless WORKER_TEST_LOG is set, so a failing pipeline can
@@ -209,6 +323,23 @@ func (p *pipeline) payloadFor(t *testing.T, transactionID uuid.UUID) []byte {
 		t.Fatalf("read outbox payload: %v", err)
 	}
 	return payload
+}
+
+// publishRaw puts a message on a topic directly, for tests that need to set up
+// a broker state the normal path would take too long to reach.
+func (p *pipeline) publishRaw(t *testing.T, topic, partitionKey, eventID string, payload []byte) {
+	t.Helper()
+
+	client, err := kgo.NewClient(kgo.SeedBrokers(p.brokers...), kgo.RequiredAcks(kgo.AllISRAcks()))
+	if err != nil {
+		t.Fatalf("producer: %v", err)
+	}
+	defer client.Close()
+
+	if err := messaging.NewProducer(client).Publish(
+		context.Background(), topic, partitionKey, eventID, payload); err != nil {
+		t.Fatalf("publish to %s: %v", topic, err)
+	}
 }
 
 func (p *pipeline) create(t *testing.T, key string, amountMinor int64) uuid.UUID {

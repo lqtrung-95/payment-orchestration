@@ -27,6 +27,8 @@ import (
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
 	transport "github.com/lequoctrung/payment-orchestrator/internal/transport/http"
 	"github.com/lequoctrung/payment-orchestrator/internal/transport/http/handler"
+	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
+	webhookproviders "github.com/lequoctrung/payment-orchestrator/internal/webhook/providers"
 )
 
 func main() {
@@ -139,6 +141,14 @@ func run() error {
 		}
 	}()
 
+	// One verifier per provider, resolved by the route segment. Adding a real
+	// provider means adding its scheme here, not widening a shared one.
+	webhookRegistry := webhook.NewRegistry(
+		webhookproviders.NewSimulator(cfg.Webhook.Provider, cfg.Webhook.Secret),
+	)
+	ingestor := webhook.NewIngestor(db, webhookRegistry, webhook.NewRepository(),
+		outbox.NewWriter(), messaging.DefaultTopics(), logger)
+
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,
 		DB:     db,
@@ -149,6 +159,7 @@ func run() error {
 		},
 		PaymentService:  paymentService,
 		IdempotencyRepo: idempotencyRepo,
+		WebhookIngestor: ingestor,
 	})
 
 	errCh := make(chan error, 1)

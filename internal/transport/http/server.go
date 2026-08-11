@@ -12,6 +12,7 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
 	"github.com/lequoctrung/payment-orchestrator/internal/transport/http/handler"
 	"github.com/lequoctrung/payment-orchestrator/internal/transport/http/middleware"
+	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
 )
 
 // Deps carries everything the transport layer needs from the rest of the
@@ -24,6 +25,7 @@ type Deps struct {
 	Health          []handler.NamedChecker
 	PaymentService  *payment.Service
 	IdempotencyRepo *idempotency.Repository
+	WebhookIngestor *webhook.Ingestor
 }
 
 // New builds the HTTP server. Ordering of the middleware chain is deliberate:
@@ -40,6 +42,12 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 		server.WithWriteTimeout(cfg.HTTP.WriteTimeout),
 		server.WithIdleTimeout(cfg.HTTP.IdleTimeout),
 		server.WithExitWaitTime(cfg.HTTP.ShutdownTimeout),
+		// Bodies are capped well below the framework default. The webhook
+		// endpoint is public and unauthenticated until its signature is checked,
+		// and checking a signature requires buffering the whole body first — so
+		// without a cap, anyone who finds the URL can make this service allocate
+		// megabytes per request before rejecting any of them.
+		server.WithMaxRequestBodySize(cfg.HTTP.MaxBodyBytes),
 	)
 
 	h.Use(
@@ -64,6 +72,15 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 		payments.Create,
 	)
 	v1.GET("/payments/:id", payments.Get)
+
+	// Outside /v1 and outside the idempotency middleware. Providers do not send
+	// an Idempotency-Key, and webhook deduplication is by the provider's own
+	// event id against a unique index — a different mechanism for a different
+	// party, deliberately not sharing the merchant-facing one.
+	if deps.WebhookIngestor != nil {
+		webhooks := handler.NewWebhook(deps.WebhookIngestor, deps.Logger)
+		h.POST("/webhooks/:provider", webhooks.Receive)
+	}
 
 	return h
 }

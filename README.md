@@ -10,11 +10,12 @@ times, out of order, before the API call that created the transaction returned.
 A settlement file that disagrees with your ledger by three cents. The happy path
 is a CRUD app; the failure paths are the actual problem.
 
-> **Status: in progress — 4 of 10 phases complete.**
+> **Status: in progress — 5 of 10 phases complete.**
 > Built and tested: ledger, state machine, idempotency, provider abstraction, a
-> provider simulator that fails on purpose, and an asynchronous pipeline —
-> transactional outbox, Kafka, error-aware retries, DLQ.
-> Webhook ingestion and reconciliation are not built yet.
+> provider simulator that fails on purpose, an asynchronous pipeline —
+> transactional outbox, Kafka, error-aware retries, DLQ — and webhook ingestion
+> with deduplication and out-of-order tolerance.
+> Reconciliation, FX, and sharding are not built yet.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -42,6 +43,9 @@ the four places that write this table."
 | A payment is never failed on an unknown outcome | `GetStatus` recovery; unresolved stays non-terminal | No |
 | Queued work is never lost or invented | Outbox row written in the domain transaction | No |
 | A declined payment is never retried | Retry policy keyed on the error class | No |
+| A webhook is processed once | `UNIQUE (provider, provider_event_id)` | No |
+| A stale webhook can't move a transaction backwards | `last_applied_event_seq` high-water mark, under a row lock | No |
+| A webhook can't invent a payment | Correlation only; no insert path from ingestion | No |
 
 Three of these deserve explanation.
 
@@ -126,6 +130,38 @@ Nothing is dropped. `dlqctl` lists and replays, and replay demands `--actor` and
 `--reason` — it moves money, and the first question afterwards is always who
 decided to.
 
+### Webhooks are untrusted, duplicated, and out of order
+
+Providers report outcomes by calling back, and those callbacks arrive more than
+once, in the wrong order, and sometimes *before* the API response that created
+the state they describe. For the asynchronous provider a callback is the only way
+an outcome is ever learned.
+
+Ingestion does as little as possible — verify the signature, store the raw bytes,
+queue, return 200 — because a provider that gets a slow answer times out and
+redelivers, multiplying load exactly when the receiver is least able to absorb
+it. Everything that interprets the event happens afterwards.
+
+| Situation | Answer |
+|---|---|
+| Same event delivered again | Unique index on `(provider, event_id)`; **200**, never an error |
+| Bad or missing signature | 401, and nothing is written — a public endpoint that stores what it is sent is a write amplifier |
+| Valid signature, old timestamp | 401. Without a window, one captured request replays forever |
+| Event older than what was applied | `superseded` — recorded, never applied, never dropped |
+| Event implying an impossible move | `rejected` by the transition matrix, structurally |
+| Event confirming the current state | `ignored`. Writing it as a transition would show a payment authorized twice |
+| No transaction matches yet | Deferred and retried. **A webhook never creates a transaction** |
+| Still unmatched after the ladder | `unmatched` + DLQ. A person decides |
+
+Staleness is judged by the provider's own sequence, never by arrival order —
+timestamps come from whichever provider host emitted the event, and two hosts
+routinely disagree about which of two events came first.
+
+The raw payload is stored as **bytes, not JSONB**: the signature was computed
+over those exact bytes, and normalising them means the stored event can never be
+verified again. `webhookctl replay` re-reads the log and reports what would
+change; a healthy log changes nothing.
+
 ### The provider misbehaves on purpose
 
 `cmd/pspsim` is a separate process implementing a deliberately unreliable
@@ -137,9 +173,9 @@ identity, so a chaos run replays exactly rather than approximately.
 |---|---|
 | `timeout_after_success` | Charge recorded, connection hangs. The flagship case. |
 | `error_5xx_after_success` | Same, wearing an HTTP status code |
-| `duplicate_webhook` | Deduplication (Phase 05) |
-| `out_of_order_webhook` | State guards on stale events (Phase 05) |
-| `webhook_before_response` | Webhook arriving before the API reply (Phase 05) |
+| `duplicate_webhook` | Deduplication against a unique index |
+| `out_of_order_webhook` | The staleness guard, judged by provider sequence |
+| `webhook_before_response` | A callback arriving before the API reply |
 | `slow_response` | Timeout budgets |
 | `partial_capture_drift` | A reconciliation break, not an error |
 | `stale_status` | Recovery cannot assume the provider is read-consistent |
@@ -154,7 +190,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 109 tests, green in
+Measured on this repo, not projected. 135 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -213,6 +249,42 @@ publisher re-sent the same batch. Claiming by lease fixed it.
 **A rolled-back payment leaves no queued work**, and a committed one leaves
 exactly one message — the property the outbox exists for.
 
+**Webhooks under chaos** — 30 payments against the asynchronous provider with
+every webhook fault live, so the outcome could only ever arrive by callback:
+
+```
+payments resolved        30 / 30 authorized
+provider charges         30 distinct   (no double charges)
+webhook requests         65 — all 200
+  duplicates absorbed    24
+events stored            41 unique
+  applied 28 · superseded 7 · ignored 6
+duplicate audit rows     0
+worst ingest latency     6.4ms
+webhookctl replay        41 events, 0 would change state
+```
+
+Delivered 100× in a row, one event produces one stored row and one transition.
+Delivered in fully reversed order, three events reach the same final state as
+forward order. An unverified payload persists nothing. Stored bytes still verify
+against the signature that arrived with them.
+
+Three real bugs came out of this phase, and two of them were invisible to the
+tests that existed at the time:
+
+- **A sequence of `0` was treated as "no sequence"** and replaced with a
+  timestamp — turning the *oldest* event in a batch into the newest and silently
+  disabling the staleness guard for exactly the delivery it exists to catch.
+- **Confirmations were recorded as transitions.** Same-state moves are legal, so
+  a payment resolved by the recovery path and then confirmed by its callback
+  showed two `authorized` rows — 15 rows for 12 payments in the first live run.
+- **A deferred retry stalled the whole consumer.** The delay tiers slept in the
+  handler, and every partition's records are processed by one goroutine, so one
+  message on the 5-minute tier held **20 live payments at `created`**. Found by
+  reading consumer-group lag during a demo, not by a test. Partitions are now
+  paused and rewound instead. The regression test was checked against the old
+  behaviour to confirm it actually fails.
+
 ## Try it
 
 Requires Go 1.26+ and a container runtime.
@@ -255,9 +327,24 @@ rather than truncated, and so is a typo like `"currrency"`.
 Run it against the misbehaving provider:
 
 ```bash
-make pspsim        # separate process, so it can be killed mid-flow
 make chaos         # switch fault injection on while traffic flows
 make outage        # take the provider down for 30s
+```
+
+To see the webhook path carry the outcome, run the worker against the
+asynchronous provider — it answers `pending`, so a callback is the only way the
+payment ever resolves:
+
+```bash
+PSP_DEFAULT_PROVIDER=psp-async-sim make worker
+```
+
+Under `make chaos` that callback arrives duplicated, out of order, and sometimes
+before the API response. Every delivery is answered 200, and the payment reaches
+`authorized` exactly once. Then check the log is safe to replay:
+
+```bash
+make replay        # re-evaluates every stored event; a healthy log changes nothing
 ```
 
 ```bash
@@ -285,16 +372,19 @@ flowchart TB
     W --> DLQ[Dead letter queue]
     W --> LG[(journal entries and postings)]
 
+    PSP -->|signed callback| WH[Webhook ingest: verify, store, ack]
+    WH --> RAW[(webhook_events_raw)]
+    WH -->|key = charge reference| OB
+    W -->|guarded by sequence and matrix| TX
+
     subgraph planned [Not built yet]
-        WH[Webhook ingest and dedup]
         REC[FX and reconciliation]
     end
 
-    WH -.-> W
     LG -.-> REC
 ```
 
-Solid edges exist today. The boxed subgraph and the dotted edges into it do not.
+Solid edges exist today. The boxed subgraph and the dotted edge into it do not.
 
 The transaction, its audit row, and the queue message are written in **one**
 database transaction — that atomicity is what makes queued work neither lost nor
@@ -304,15 +394,16 @@ One service with enforced module boundaries, deliberately not microservices — 
 distributed monolith would be a worse design, not a better one, at this size.
 
 ```
-cmd/          orchestrator, worker, migrate, pspsim, dlqctl
+cmd/          orchestrator, worker, migrate, pspsim, dlqctl, webhookctl
 internal/
   domain/     money, ledger, transaction   — no I/O, no framework types
   store/      repositories                  — take a Querier, so callers own the tx boundary
   psp/        provider contract, error taxonomy, retry policy, adapters
   simulator/  the provider that fails on purpose
   outbox/     transactional outbox writer and relay
-  messaging/  Kafka topics, producer, consumer group
-  worker/     queue handlers, dedup
+  messaging/  Kafka topics, producer, consumer group with partition-level deferral
+  webhook/    ingest, per-provider verifiers, guarded processor, replay
+  worker/     queue handlers, router, dedup
   resilience/ backoff with full jitter, circuit breaker
   service/    orchestration
   transport/  Hertz handlers + middleware
@@ -334,6 +425,9 @@ the alternatives that were seriously considered and rejected.
 - [0003 — Shard key is merchant_id](docs/adr/0003-shard-key-is-merchant-id.md)
 - [0004 — Idempotency: scope, fingerprint, and fencing](docs/adr/0004-idempotency-scope-fingerprint-and-fencing.md)
 - [0005 — Transition matrix enforced in two places](docs/adr/0005-transition-matrix-enforced-in-two-places.md)
+- [0006 — Ambiguous provider outcomes are resolved, not guessed](docs/adr/0006-ambiguous-provider-outcomes-are-resolved-not-guessed.md)
+- [0007 — Transactional outbox and error-aware retries](docs/adr/0007-transactional-outbox-and-error-aware-retries.md)
+- [0008 — Webhook ingestion, deduplication, and ordering](docs/adr/0008-webhook-ingestion-and-ordering.md)
 
 ## Known gaps
 
@@ -354,8 +448,16 @@ Stated plainly, because a README that omits them is not worth reading.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
 - **Consumer lag is not exported.** A message stuck in a retry tier is invisible
-  without inspecting Kafka by hand; Phase 09 fixes this.
-- **`processed_events` grows unbounded** — it needs a pruning job.
+  without inspecting Kafka by hand — which is precisely how the consumer stall
+  above was found, by hand, during a demo. Phase 09 fixes this.
+- **`processed_events` and `webhook_events_raw` grow unbounded** — both need
+  pruning, and the raw payloads may carry PII, so that one also needs a
+  retention window and encryption at rest.
+- **Capture and refund webhooks are parsed but not applied.** Neither operation
+  has an HTTP surface, and applying a capture from a callback would post to the
+  ledger from a path with no amount reconciliation behind it.
+- **The webhook endpoint has no rate limit.** Body size is capped; request rate
+  is not.
 - **The DLQ needs someone to watch it.** A dead letter queue nobody looks at is
   a slower way of dropping messages.
 
@@ -367,13 +469,15 @@ Stated plainly, because a README that omits them is not worth reading.
 | 02 | Ledger, transaction state machine, idempotency | Done |
 | 03 | PSP abstraction + deliberately misbehaving simulator | Done |
 | 04 | Transactional outbox → Kafka → retry ladder → DLQ | Done |
-| 05 | Webhook ingest, dedup, out-of-order tolerance | Next |
-| 06 | Payment instrument binding + lifecycle | |
+| 05 | Webhook ingest, dedup, out-of-order tolerance | Done |
+| 06 | Payment instrument binding + lifecycle | Next |
 | 07 | FX conversion + settlement reconciliation | |
 | 08 | Sharding + cross-shard transactions (TCC) | |
 | 09 | OpenTelemetry, load + chaos testing | |
 | 10 | Architecture docs and demo | |
 
-Phase 05 answers the inbound half: webhooks arriving duplicated, out of order,
-and sometimes before the API call that created the transaction has returned. The
-faults for all three already exist in the simulator, waiting for a receiver.
+Phases 01–05 are the shippable core: a payment can be created, authorized
+asynchronously, retried intelligently, and resolved by a callback that may arrive
+duplicated, out of order, or early. Everything after this is depth — instrument
+lifecycle, FX and reconciliation, sharding, and the observability needed to put
+real numbers in this README.

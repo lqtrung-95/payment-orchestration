@@ -15,6 +15,15 @@ const HeaderEventID = "event-id"
 // which is what selects the next rung of the retry ladder.
 const HeaderAttempt = "retry-attempt"
 
+// HeaderOriginTopic names the topic a message was first published to.
+//
+// The retry tiers are shared by every kind of work, so once a message is on
+// one, its own topic no longer says what it is. Carrying the origin forward is
+// what lets a single consumer group route a deferred message back to the
+// handler that owns it, and it is also the first thing anyone wants to know
+// when inspecting the dead letter queue.
+const HeaderOriginTopic = "origin-topic"
+
 // Producer publishes to Kafka.
 type Producer struct {
 	client *kgo.Client

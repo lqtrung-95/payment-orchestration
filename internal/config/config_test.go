@@ -70,6 +70,7 @@ func TestLoadReportsAllErrorsAtOnce(t *testing.T) {
 func TestLoadParsesOverrides(t *testing.T) {
 	setMinimalEnv(t)
 	t.Setenv("APP_ENV", "production")
+	t.Setenv("WEBHOOK_SECRET", "a-real-production-secret")
 	t.Setenv("HTTP_ADDR", ":9999")
 	t.Setenv("HTTP_REQUEST_TIMEOUT", "2s")
 	t.Setenv("POSTGRES_MAX_CONNS", "50")
@@ -107,6 +108,25 @@ func TestLoadParsesOverrides(t *testing.T) {
 		if cfg.Kafka.Brokers[i] != want[i] {
 			t.Errorf("Kafka.Brokers[%d] = %q, want %q", i, cfg.Kafka.Brokers[i], want[i])
 		}
+	}
+}
+
+// A webhook secret published in this repository authenticates nothing: anyone
+// can sign a delivery that says a payment succeeded. Refusing to boot is the
+// only safe answer, and it is far better than accepting forgeries quietly.
+func TestLoadRefusesTheDevelopmentWebhookSecretInProduction(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("APP_ENV", "production")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted the development webhook secret in production")
+	}
+
+	// The same value is fine outside production, where the local stack has to
+	// work with no configuration at all.
+	t.Setenv("APP_ENV", "development")
+	if _, err := Load(); err != nil {
+		t.Errorf("Load() rejected the development secret outside production: %v", err)
 	}
 }
 

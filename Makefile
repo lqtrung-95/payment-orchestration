@@ -60,6 +60,7 @@ build: ## Build binaries into bin/
 	go build -o $(BIN_DIR)/worker ./cmd/worker
 	go build -o $(BIN_DIR)/pspsim ./cmd/pspsim
 	go build -o $(BIN_DIR)/dlqctl ./cmd/dlqctl
+	go build -o $(BIN_DIR)/webhookctl ./cmd/webhookctl
 
 .PHONY: run
 run: ## Run the orchestrator against the local stack
@@ -68,6 +69,10 @@ run: ## Run the orchestrator against the local stack
 # --- Provider simulator ----------------------------------------------------
 
 PSPSIM_URL ?= http://localhost:9091
+
+# Where the simulator delivers its callbacks. It is the orchestrator's public
+# webhook route, so the local stack exercises the same path a real provider uses.
+PSPSIM_WEBHOOK_URL ?= http://localhost:8080/webhooks/psp-sim
 
 .PHONY: worker
 worker: ## Run the payment worker (consumes Kafka, calls providers)
@@ -79,7 +84,11 @@ dlq: ## List dead-lettered payment messages
 
 .PHONY: pspsim
 pspsim: ## Run the fault-injecting provider simulator (separate process)
-	go run ./cmd/pspsim
+	PSPSIM_WEBHOOK_URL=$(PSPSIM_WEBHOOK_URL) go run ./cmd/pspsim
+
+.PHONY: replay
+replay: ## Re-evaluate the stored webhook log against current state (writes nothing)
+	go run ./cmd/webhookctl replay -v
 
 .PHONY: faults
 faults: ## Show the simulator's current fault configuration

@@ -27,6 +27,8 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/resilience"
 	"github.com/lequoctrung/payment-orchestrator/internal/service/payment"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
+	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
+	webhookproviders "github.com/lequoctrung/payment-orchestrator/internal/webhook/providers"
 	"github.com/lequoctrung/payment-orchestrator/internal/worker"
 )
 
@@ -100,10 +102,24 @@ func run() error {
 		"default": resilience.NewCircuitBreaker(cfg.PSP.DefaultProvider, resilience.DefaultCircuitConfig()),
 	}
 
-	handler := worker.NewAuthorizeHandler(db, service, producer, topics,
-		worker.NewDedup(consumerGroup), breakers, logger)
+	dedup := worker.NewDedup(consumerGroup)
 
-	// One consumer group across the work topic and every retry tier. A message
+	webhookRegistry := webhook.NewRegistry(
+		webhookproviders.NewSimulator(cfg.Webhook.Provider, cfg.Webhook.Secret),
+	)
+	processor := webhook.NewProcessor(db, webhookRegistry, webhook.NewRepository(),
+		txstore.NewRepository(), logger)
+
+	// One router across both kinds of work. They share the retry ladder and the
+	// dead letter queue, so a message is routed by the topic it originated on
+	// rather than by where it currently sits.
+	router := worker.NewRouter(db, producer, topics, dedup, logger)
+	router.Register(topics.Authorize,
+		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, logger).Handle)
+	router.Register(topics.Webhook,
+		worker.NewWebhookHandler(db, processor, producer, topics, dedup, logger).Handle)
+
+	// One consumer group across the work topics and every retry tier. A message
 	// on a retry tier is the same work, merely deferred, so it wants the same
 	// handler rather than a parallel implementation that could drift.
 	consumer, err := messaging.NewConsumer(cfg.Kafka.Brokers, consumerGroup,
@@ -113,13 +129,17 @@ func run() error {
 	}
 	defer consumer.Close()
 
+	// Deferred retries are honoured by pausing partitions rather than sleeping,
+	// so a message waiting out the 30-minute tier does not stall live work.
+	consumer = consumer.WithDue(topics.DueAt)
+
 	logger.InfoContext(ctx, "worker starting",
 		slog.String("group", consumerGroup),
 		slog.Any("topics", topics.Consumed()),
 		slog.String("provider", cfg.PSP.DefaultProvider))
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- consumer.Run(ctx, handler.Handle) }()
+	go func() { errCh <- consumer.Run(ctx, router.Handle) }()
 
 	select {
 	case err := <-errCh:

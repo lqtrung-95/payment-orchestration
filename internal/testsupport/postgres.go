@@ -70,6 +70,7 @@ func Truncate(t *testing.T, db *postgres.DB) {
 
 	const query = `
 		TRUNCATE
+			webhook_events_raw,
 			transaction_state_changes,
 			postings,
 			journal_entries,

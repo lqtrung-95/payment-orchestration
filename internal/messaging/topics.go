@@ -17,6 +17,12 @@ const (
 	// TopicAuthorize carries authorization work off the request path.
 	TopicAuthorize = "payment.authorize"
 
+	// TopicWebhook carries accepted provider callbacks to their processing.
+	// Ingestion only persists and acknowledges; everything after that happens
+	// here, because a provider that waits on our processing retries and
+	// amplifies load exactly when we are least able to absorb it.
+	TopicWebhook = "webhook.received"
+
 	// TopicDLQ holds messages that exhausted the retry ladder. Nothing is
 	// deleted: a payment that could not be completed is evidence, and it needs a
 	// human decision rather than a silent drop.
@@ -51,13 +57,19 @@ var RetryTiers = []RetryTier{
 // previous run's backlog, which turns real failures into noise and vice versa.
 type Topics struct {
 	Authorize string
+	Webhook   string
 	DLQ       string
 	Retry     []RetryTier
 }
 
 // DefaultTopics is the production set.
 func DefaultTopics() Topics {
-	return Topics{Authorize: TopicAuthorize, DLQ: TopicDLQ, Retry: RetryTiers}
+	return Topics{
+		Authorize: TopicAuthorize,
+		Webhook:   TopicWebhook,
+		DLQ:       TopicDLQ,
+		Retry:     RetryTiers,
+	}
 }
 
 // PrefixedTopics returns the same shape under a namespace, for tests.
@@ -72,12 +84,17 @@ func PrefixedTopics(prefix string, retryDelay time.Duration) Topics {
 		}
 		retry[i] = RetryTier{Topic: prefix + tier.Topic, Delay: delay}
 	}
-	return Topics{Authorize: prefix + TopicAuthorize, DLQ: prefix + TopicDLQ, Retry: retry}
+	return Topics{
+		Authorize: prefix + TopicAuthorize,
+		Webhook:   prefix + TopicWebhook,
+		DLQ:       prefix + TopicDLQ,
+		Retry:     retry,
+	}
 }
 
 // All lists every topic, for provisioning and subscription.
 func (t Topics) All() []string {
-	out := []string{t.Authorize, t.DLQ}
+	out := []string{t.Authorize, t.Webhook, t.DLQ}
 	for _, tier := range t.Retry {
 		out = append(out, tier.Topic)
 	}
@@ -88,7 +105,7 @@ func (t Topics) All() []string {
 // a parking area inspected deliberately, and consuming it automatically would
 // put failed work straight back into the loop it just escaped.
 func (t Topics) Consumed() []string {
-	out := []string{t.Authorize}
+	out := []string{t.Authorize, t.Webhook}
 	for _, tier := range t.Retry {
 		out = append(out, tier.Topic)
 	}
@@ -123,6 +140,21 @@ func (t Topics) DelayFor(topic string) (time.Duration, bool) {
 	return 0, false
 }
 
+// DueAt reports when a message may be processed: immediately for live work, and
+// one tier delay after the broker received it for a deferred retry.
+//
+// Handed to the consumer rather than applied inside a handler. A handler that
+// waits is a handler that blocks every partition the consumer owns, and a wait
+// longer than the rebalance timeout gets the consumer evicted from its group —
+// so the waiting has to happen where partitions can be paused instead.
+func (t Topics) DueAt(msg Message) time.Time {
+	delay, isRetryTier := t.DelayFor(msg.Topic)
+	if !isRetryTier || delay == 0 {
+		return time.Time{}
+	}
+	return msg.Timestamp.Add(delay)
+}
+
 // workPartitions is the partition count for topics carrying payment work.
 //
 // Ordering is guaranteed per partition, and messages are keyed by merchant, so
@@ -142,6 +174,7 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, topics Topics) error 
 
 	wanted := map[string]int32{
 		topics.Authorize: workPartitions,
+		topics.Webhook:   workPartitions,
 		// One partition: the DLQ is inspected and replayed by hand, so ordering
 		// across it is more useful than throughput.
 		topics.DLQ: 1,

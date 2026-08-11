@@ -31,7 +31,7 @@ const selectColumns = `
 	id, merchant_id, shard_key, idempotency_key, state,
 	amount_minor, currency, captured_minor, refunded_minor,
 	COALESCE(psp, ''), COALESCE(psp_reference, ''),
-	version, created_at, updated_at`
+	version, last_applied_event_seq, created_at, updated_at`
 
 func (r *Repository) Insert(ctx context.Context, q postgres.Querier, t *domain.Transaction) error {
 	const query = `
@@ -64,6 +64,27 @@ func (r *Repository) GetForUpdate(ctx context.Context, q postgres.Querier, id uu
 	return scanTransaction(q.QueryRow(ctx, query, id))
 }
 
+// GetByProviderReferenceForUpdate finds the transaction a provider event refers
+// to, holding a row lock until the surrounding transaction ends.
+//
+// Correlation is by reference alone. A webhook carries the provider's charge
+// reference and nothing else that identifies us, and the reference is globally
+// unique, so adding the provider name to the predicate would only introduce a
+// way for a route name and an adapter name to disagree and break correlation.
+//
+// The lock matters here more than elsewhere: two deliveries for one charge can
+// be processed concurrently, and both would otherwise read the same high-water
+// mark and both conclude they are the newer event.
+func (r *Repository) GetByProviderReferenceForUpdate(
+	ctx context.Context,
+	q postgres.Querier,
+	reference string,
+) (*domain.Transaction, error) {
+	query := `SELECT ` + selectColumns + `
+		FROM payment_transactions WHERE psp_reference = $1 FOR UPDATE`
+	return scanTransaction(q.QueryRow(ctx, query, reference))
+}
+
 // Update writes the aggregate using optimistic locking, and bumps the version.
 //
 // The version in the WHERE clause is what makes two concurrent captures safe:
@@ -77,12 +98,16 @@ func (r *Repository) Update(ctx context.Context, q postgres.Querier, t *domain.T
 			refunded_minor = $3,
 			psp = NULLIF($4, ''),
 			psp_reference = NULLIF($5, ''),
+			-- Never moves backwards. A path that writes without knowing about
+			-- provider events leaves the mark where it was rather than resetting
+			-- it, which would make every already-applied event look fresh again.
+			last_applied_event_seq = GREATEST(last_applied_event_seq, $6),
 			version = version + 1
-		WHERE id = $6 AND version = $7`
+		WHERE id = $7 AND version = $8`
 
 	tag, err := q.Exec(ctx, query,
 		string(t.State), t.Captured.Amount(), t.Refunded.Amount(),
-		t.PSP, t.PSPReference, t.ID, t.Version,
+		t.PSP, t.PSPReference, t.LastAppliedEventSeq, t.ID, t.Version,
 	)
 	if err != nil {
 		return fmt.Errorf("update transaction %s: %w", t.ID, err)
@@ -135,7 +160,8 @@ func scanTransaction(row pgx.Row) (*domain.Transaction, error) {
 	err := row.Scan(
 		&t.ID, &t.MerchantID, &t.ShardKey, &t.IdempotencyKey, &state,
 		&amount, &currency, &captured, &refunded,
-		&t.PSP, &t.PSPReference, &t.Version, &t.CreatedAt, &t.UpdatedAt,
+		&t.PSP, &t.PSPReference, &t.Version, &t.LastAppliedEventSeq,
+		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

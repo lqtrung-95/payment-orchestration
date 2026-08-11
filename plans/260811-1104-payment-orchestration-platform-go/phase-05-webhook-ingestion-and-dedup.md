@@ -1,6 +1,6 @@
 # Phase 05 — Webhook Ingestion, Dedup, Out-of-Order Handling
 
-**Priority:** P0 · **Status:** Not started · **Week:** 8
+**Priority:** P0 · **Status:** Complete · **Week:** 8 · **Verified on 2026-08-12**
 
 **Shippable checkpoint.** After this phase the project is complete and demoable. Everything later is upside.
 
@@ -68,15 +68,15 @@ The unique index is the dedup enforcement point — Redis is a fast-path optimis
 
 ## Todo
 
-- [ ] Per-provider signature verification, constant-time
-- [ ] Timestamp replay window
-- [ ] Raw persist + unique-index dedup
-- [ ] Fast ack → async Kafka processing
-- [ ] Transaction correlation
-- [ ] `pending_correlation` parking + TTL
-- [ ] Staleness guard + transition enforcement
-- [ ] Raw-log replay tool
-- [ ] Fault-mode test suite
+- [x] Per-provider signature verification, constant-time
+- [x] Timestamp replay window
+- [x] Raw persist + unique-index dedup
+- [x] Fast ack → async Kafka processing
+- [x] Transaction correlation
+- [x] Correlation parking + escalation — via the retry ladder, not a separate table
+- [x] Staleness guard + transition enforcement
+- [x] Raw-log replay tool (`webhookctl replay`)
+- [x] Fault-mode test suite
 
 ## Success criteria
 
@@ -98,6 +98,84 @@ The unique index is the dedup enforcement point — Redis is a fast-path optimis
 - Unverified signature → reject with 401 and log; never process, never park.
 - Webhook endpoints are public: rate limit per provider IP range, cap body size.
 - Raw payloads may contain PII — encrypt at rest, define a retention window.
+
+## Verified on 2026-08-12
+
+**Chaos run** — 30 payments against the async provider with every webhook fault live
+(duplicate 0.25, out-of-order 0.15, before-response 0.10, plus the ambiguous-outcome faults):
+
+| Measure | Result |
+|---|---|
+| Payments resolved | 30 / 30 authorized |
+| Provider charges | 30 distinct references — no double charges |
+| Webhook requests served | 65, **all 200** |
+| Duplicates absorbed | 24, all answered 200 |
+| Events stored | 41 unique |
+| Outcomes | 28 applied · 7 superseded · 6 ignored |
+| Transactions with a duplicate `authorized` audit row | **0** |
+| Worst ingest latency | 6.4ms (target: p99 under 50ms) |
+| `webhookctl replay` | 41 events, 0 would change state |
+
+**Tests** — full suite green under `-race`, lint clean. Webhook coverage:
+signature/tamper/wrong-secret/replay-window/missing-header rejection; 100×
+redelivery producing one stored event and one transition; unverified payload
+persisting nothing; stored bytes still verifying against the delivered signature;
+stale supersession; fully reversed delivery reaching the same state; illegal
+transition rejected; confirmation of the current state writing no audit row;
+reprocessing being a no-op; whole-log replay changing nothing. End-to-end over
+real Kafka and a real HTTP endpoint: async resolution by callback,
+duplicate+out-of-order together producing one transition, webhook-before-response
+correlating without inventing a transaction, and a deferred retry not stalling
+live work.
+
+## Bugs found
+
+**Sequence 0 was treated as "no sequence".** Ingest substituted a timestamp when
+the parsed sequence was zero, which rewrote the *oldest* event in a batch into the
+newest and silently defeated the staleness guard. Caught because the out-of-order
+fault emits `head - 1` = 0. Fixed by making the adapter's value authoritative;
+deriving a sequence is now the adapter's job, since only it knows whether its
+provider has one. Regression test pins it.
+
+**Confirmations were recorded as transitions.** An event agreeing with the current
+state passed `CanTransitionTo` (same-state moves are legal) and was written to the
+audit trail, so a payment resolved by the recovery path and then confirmed by its
+callback showed two `authorized` rows. Found in the first live run — 15 rows for
+12 payments. Now `ignored`.
+
+**Deferred retries stalled the entire consumer.** The delay tiers slept in the
+handler. Records from all assigned partitions are processed by one goroutine, so
+one message on the 5-minute tier held **20 live payments at `created`** — found
+by inspecting consumer-group lag during the demo, not by a test. A 30-minute wait
+would additionally exceed the rebalance timeout and evict the consumer. Fixed by
+pausing and rewinding the partition instead of sleeping. The regression test was
+confirmed non-vacuous by restoring the old behaviour and watching it fail.
+
+## Deviations from the plan
+
+- **`pending_correlation` table dropped.** The retry ladder already provides the
+  waiting, escalation, and DLQ that the table's TTL sweeper would have
+  duplicated. One mechanism instead of two.
+- **`last_applied_event_at` → `last_applied_event_seq`.** A sequence survives
+  clock skew between provider hosts; a timestamp does not.
+- **Replay narrowed** from "reproduces identical state in an empty database" to
+  "changes nothing against current state". The original is unachievable without
+  event-sourcing the whole aggregate — the log holds callbacks, not the API calls
+  and provider responses that create and move transactions. See ADR 0008.
+
+## Deferred
+
+- **Capture and refund events are parsed but not applied.** Neither operation has
+  an HTTP surface, and applying a capture from a callback would post to the ledger
+  from a path with no amount reconciliation behind it.
+- **`webhook_events_raw` grows without bound** and may hold PII. Needs retention
+  and encryption at rest.
+- **No rate limiting** on the public endpoint. Body size is capped; request rate
+  is not.
+- **Still no authentication** on the merchant API. `X-Merchant-Id` remains an
+  unauthenticated header.
+- **Consumer lag is not exported**, so a paused partition is invisible without
+  querying Kafka by hand — which is exactly how the stall above was found.
 
 ## Next steps
 

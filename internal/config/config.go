@@ -6,7 +6,10 @@
 // refuses to start.
 package config
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type Config struct {
 	Env      string
@@ -16,7 +19,28 @@ type Config struct {
 	Kafka    Kafka
 	Log      Log
 	PSP      PSP
+	Webhook  Webhook
 }
+
+// Webhook configures the provider-facing ingestion endpoint.
+type Webhook struct {
+	// Provider is the route segment providers post to: /webhooks/{provider}.
+	Provider string
+
+	// Secret is the shared secret the signature is verified against. The
+	// development default is refused in production — a signature scheme
+	// verified against a value published in this repository authenticates
+	// nothing, and failing to boot is far better than accepting forgeries.
+	Secret string
+}
+
+// devWebhookSecret matches the simulator's own default so the local stack works
+// with no configuration. It must never be the value in a deployed environment.
+// It is a published default rather than a credential; the production check in
+// Load is what stops it being used somewhere it would become one.
+//
+//nolint:gosec // G101: deliberately public, and refused in production
+const devWebhookSecret = "sim-webhook-secret"
 
 type PSP struct {
 	// SimulatorURL is the fault-injecting provider simulator. It runs as its own
@@ -44,6 +68,11 @@ type HTTP struct {
 	// PSPs, so an unbounded handler leaks goroutines and connection slots when
 	// a provider hangs.
 	RequestTimeout time.Duration
+
+	// MaxBodyBytes caps request bodies. The webhook endpoint is public and
+	// cannot authenticate a request without buffering the whole body first, so
+	// an uncapped body is an allocation amplifier for anyone who finds the URL.
+	MaxBodyBytes int
 }
 
 type Postgres struct {
@@ -101,6 +130,7 @@ func Load() (*Config, error) {
 			IdleTimeout:     l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 			ShutdownTimeout: l.duration("HTTP_SHUTDOWN_TIMEOUT", 20*time.Second),
 			RequestTimeout:  l.duration("HTTP_REQUEST_TIMEOUT", 30*time.Second),
+			MaxBodyBytes:    l.int("HTTP_MAX_BODY_BYTES", 1<<20),
 		},
 
 		Postgres: Postgres{
@@ -141,11 +171,24 @@ func Load() (*Config, error) {
 			DefaultProvider: l.str("PSP_DEFAULT_PROVIDER", "psp-sync-sim"),
 			Timeout:         l.duration("PSP_TIMEOUT", 5*time.Second),
 		},
+
+		Webhook: Webhook{
+			Provider: l.str("WEBHOOK_PROVIDER", "psp-sim"),
+			Secret:   l.str("WEBHOOK_SECRET", devWebhookSecret),
+		},
 	}
 
 	if err := l.err(); err != nil {
 		return nil, err
 	}
+
+	// Checked after the rest so an operator sees every other problem too, rather
+	// than fixing this one and discovering the next.
+	if cfg.IsProduction() && cfg.Webhook.Secret == devWebhookSecret {
+		return nil, fmt.Errorf("WEBHOOK_SECRET is still the development default; " +
+			"webhook signatures would be verifiable by anyone with the source")
+	}
+
 	return cfg, nil
 }
 

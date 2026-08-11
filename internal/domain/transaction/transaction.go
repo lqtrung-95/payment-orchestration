@@ -48,6 +48,11 @@ type Transaction struct {
 	// what it read, so of two concurrent captures exactly one succeeds.
 	Version int
 
+	// LastAppliedEventSeq is the high-water mark of provider events applied to
+	// this transaction. Webhooks arrive out of order routinely, so an event is
+	// judged stale by its own sequence rather than by when it turned up.
+	LastAppliedEventSeq int64
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
