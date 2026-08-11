@@ -1,0 +1,238 @@
+# Payment Orchestration Platform
+
+[![CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml/badge.svg)](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
+
+A multi-PSP payment orchestrator in Go, built around one idea: **everything
+interesting in a payment system comes from things going wrong.**
+
+A provider that times out *after* charging the card. A webhook delivered five
+times, out of order, before the API call that created the transaction returned.
+A settlement file that disagrees with your ledger by three cents. The happy path
+is a CRUD app; the failure paths are the actual problem.
+
+> **Status: in progress — 2 of 10 phases complete.**
+> The transaction core is built and tested: ledger, state machine, idempotency.
+> Provider integration, webhooks, queueing, and reconciliation are not built yet.
+> Everything claimed below is verified by tests in this repo — see
+> [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
+> roadmap is kept separate, at the bottom.
+
+---
+
+## The guarantees, and what enforces them
+
+The design principle throughout: **a rule that matters is enforced by the
+database, not by convention.** Application code gets bypassed by migrations,
+admin sessions, and repair scripts. Money bugs found in production are almost
+never "someone forgot to validate" — they are "the validation existed in one of
+the four places that write this table."
+
+| Guarantee | Enforced by | Bypassable? |
+|---|---|---|
+| Journal entries balance per currency | `DEFERRABLE` constraint trigger, fires at COMMIT | No |
+| Ledger history is immutable | `BEFORE UPDATE OR DELETE` triggers reject both | No |
+| A posting can't touch a different-currency account | Composite FK on `(account_id, currency)` | No |
+| Can't capture more than authorised | `CHECK (captured_minor <= amount_minor)` | No |
+| Can't refund more than captured | `CHECK (refunded_minor <= captured_minor)` | No |
+| Illegal state transitions | Trigger against a transition table **+** Go aggregate | No |
+| One key ⇒ one execution | `UNIQUE (merchant_id, key)` inside a committed tx | No |
+| Concurrent writers can't clobber | `version` column, optimistic lock | No |
+
+Three of these deserve explanation.
+
+**Balance is checked at COMMIT, not at INSERT.** A journal entry is legitimately
+unbalanced between its first and last posting, so a normal trigger would reject
+every valid entry. A `DEFERRABLE INITIALLY DEFERRED` constraint trigger fires
+once, at commit, when the entry is whole.
+
+**The state machine is declared twice** — as a map in Go and as rows in
+Postgres — and a test proves the two identical. Two encodings of one rule drift
+apart unless something compares them, and a drift means the application believes
+a transition is legal that the database will reject at runtime, or worse, the
+reverse.
+
+**Idempotency ownership is decided by a unique constraint, not a read-then-write.**
+The claim is committed *before* the handler runs. Until the in-flight row is
+visible to other connections, a concurrent request carrying the same key finds
+nothing and concludes it may proceed — which is precisely how double charges
+happen.
+
+## Balances are derived, never stored
+
+`postings` are insert-only; balances are computed by aggregating them. A stored
+balance is a second source of truth that drifts from the entries it summarises,
+and once it has drifted there is no way to tell which of the two is wrong.
+
+The ledger records **money that moved, not intent**. Creating or authorising a
+payment posts nothing — an authorisation is a hold at the issuer, not a
+transfer. Postings begin at capture. Booking authorisations would inflate every
+balance by the value of holds that may never be captured, and reconciliation
+against a settlement file would never match.
+
+Money is `int64` minor units plus an ISO-4217 currency, with no float
+constructor anywhere in the codebase. Proportional amounts (fees, splits) go
+through an allocation that distributes the truncation remainder, so parts always
+sum back to the original exactly.
+
+## Verified behaviour
+
+Measured on this repo, not projected. 56 tests, green in
+[CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
+against a real Postgres.
+
+**Idempotency, end to end over HTTP** — 50 concurrent `POST /v1/payments`
+carrying one idempotency key:
+
+```
+42 × 201   (1 execution + 41 replays)
+ 8 × 409   (in-flight, told to retry)
+------------------------------------
+transactions created: 1
+idempotency rows:     1
+```
+
+Replays are **byte-identical** to the original response. Reformatted JSON — same
+content, reordered keys, different whitespace — still replays rather than being
+rejected. The same key with a *different* body returns 409 rather than silently
+replaying, which would discard the second payment.
+
+**Money** — a 20,000-case property test asserts allocation never creates or
+destroys a minor unit, for any amount and any ratios. Overflow is detected on
+add, subtract, negate, multiply, and inside allocation.
+
+**Ledger** — unbalanced entry rejected at commit; empty entry rejected;
+cross-currency posting rejected; `UPDATE`/`DELETE` on postings rejected. Invariant
+`sum(debits) = sum(credits)` holds across a 25-entry three-way fee split.
+
+**Concurrency** — 20 concurrent writers on one transaction: version advances
+exactly once per winner, every loser gets a typed conflict error rather than
+silently losing its write.
+
+## Try it
+
+Requires Go 1.26+ and a container runtime.
+
+```bash
+cp .env.example .env
+make up            # postgres, redis, kafka — waits until healthy
+make migrate-up
+make run
+```
+
+Create a payment:
+
+```bash
+curl -X POST http://localhost:8080/v1/payments \
+  -H 'X-Merchant-Id: m_acme' \
+  -H 'Idempotency-Key: order-1001' \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":12550,"currency":"USD"}'
+```
+
+Send it again with the same key — you get the identical response and an
+`Idempotency-Replayed: true` header, and no second transaction. Send it with a
+different amount and the same key, and you get a 409.
+
+Amounts are integer minor units. `{"amount":125.50}` is rejected at the boundary
+rather than truncated, and so is a typo like `"currrency"`.
+
+```bash
+make test          # includes integration tests against the live stack
+make check         # fmt, vet, lint, test
+```
+
+## Architecture
+
+```mermaid
+graph TB
+    Client -->|Idempotency-Key| MW[Idempotency middleware]
+    MW -->|claim committed first| IK[(idempotency_keys)]
+    MW --> H[Payment handler]
+    H --> S[Payment service]
+    S -->|one transaction| TX[(payment_transactions)]
+    S -->|one transaction| AUD[(transaction_state_changes)]
+    S -. "capture, later phase" .-> LG[(journal_entries and postings)]
+
+    TX -.->|trigger| SM[transaction_state_transitions]
+    LG -.->|deferred trigger| BAL{{entries must balance}}
+
+    subgraph "Not built yet"
+        PSP[PSP adapters + fault simulator]
+        OB[Outbox → Kafka → retry/DLQ]
+        WH[Webhook ingest + dedup]
+        REC[FX + reconciliation]
+    end
+
+    S -.-> PSP
+    S -.-> OB
+    WH -.-> S
+    LG -.-> REC
+```
+
+Solid edges exist today; dotted edges and the boxed subgraph do not.
+
+One service with enforced module boundaries, deliberately not microservices — a
+distributed monolith would be a worse design, not a better one, at this size.
+
+```
+cmd/          orchestrator, migrate
+internal/
+  domain/     money, ledger, transaction   — no I/O, no framework types
+  store/      repositories                  — take a Querier, so callers own the tx boundary
+  service/    orchestration
+  transport/  Hertz handlers + middleware
+  platform/   postgres, redis, kafka, telemetry, sharding
+migrations/   embedded in the binary
+```
+
+Repositories accept a `Querier` satisfied by both a pool and a transaction. That
+is what will let the transactional outbox commit a domain write and an outbox
+write together — the guarantee is lost the moment they can be split.
+
+## Design decisions
+
+Written when the decision was made, not reconstructed afterwards. Each records
+the alternatives that were seriously considered and rejected.
+
+- [0001 — Money as integer minor units](docs/adr/0001-money-as-integer-minor-units.md)
+- [0002 — Double-entry ledger with derived balances](docs/adr/0002-double-entry-ledger-with-derived-balances.md)
+- [0003 — Shard key is merchant_id](docs/adr/0003-shard-key-is-merchant-id.md)
+- [0004 — Idempotency: scope, fingerprint, and fencing](docs/adr/0004-idempotency-scope-fingerprint-and-fencing.md)
+- [0005 — Transition matrix enforced in two places](docs/adr/0005-transition-matrix-enforced-in-two-places.md)
+
+## Known gaps
+
+Stated plainly, because a README that omits them is not worth reading.
+
+- **No authentication.** `X-Merchant-Id` is an unauthenticated header — any
+  caller can claim to be any merchant. The tenant isolation is only as real as
+  that header. Must be replaced before this is exposed anywhere.
+- **No reaper for expired idempotency records**, so that table grows unbounded.
+- **Capture and refund have no HTTP surface.** Both exist on the aggregate and
+  are tested, but need a provider to be meaningful.
+- **Sharding is decided, not implemented.** The key is derived and stored on
+  every row; routing across physical databases comes later. Storing it now is
+  the point — backfilling a shard key across a populated ledger means rewriting
+  every row while the service stays online.
+- **No load or chaos numbers yet.** They require the fault-injecting provider
+  simulator, which is the next phase. This README will not carry a throughput
+  figure until one has actually been measured.
+
+## Roadmap
+
+| # | Phase | Status |
+|---|---|---|
+| 01 | Service skeleton, config, migrations, CI | Done |
+| 02 | Ledger, transaction state machine, idempotency | Done |
+| 03 | PSP abstraction + deliberately misbehaving simulator | Next |
+| 04 | Transactional outbox → Kafka → retry ladder → DLQ | |
+| 05 | Webhook ingest, dedup, out-of-order tolerance | |
+| 06 | Payment instrument binding + lifecycle | |
+| 07 | FX conversion + settlement reconciliation | |
+| 08 | Sharding + cross-shard transactions (TCC) | |
+| 09 | OpenTelemetry, load + chaos testing | |
+| 10 | Architecture docs and demo | |
+
+Phase 03 is the one that matters most: a provider simulator that times out after
+succeeding, duplicates and reorders webhooks, and goes down mid-flow. Every
+correctness claim this project wants to make is untestable without it.
