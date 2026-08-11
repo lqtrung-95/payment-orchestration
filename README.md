@@ -372,7 +372,7 @@ flowchart TB
     W --> DLQ[Dead letter queue]
     W --> LG[(journal entries and postings)]
 
-    PSP -->|signed callback| WH[Webhook ingest: verify, store, ack]
+    PSP -->|signed callback| WH[Webhook ingest - verify, store, ack]
     WH --> RAW[(webhook_events_raw)]
     WH -->|key = charge reference| OB
     W -->|guarded by sequence and matrix| TX
