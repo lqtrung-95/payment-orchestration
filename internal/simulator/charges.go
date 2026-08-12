@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -142,6 +143,24 @@ func (s *Store) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.byKey)
+}
+
+// List returns every charge, oldest first.
+//
+// Exposed so the count is observable from outside the process. "The provider
+// was charged exactly once" is the central claim this simulator exists to
+// support, and a claim that can only be checked by an in-process test is one
+// nobody else can check at all.
+func (s *Store) List() []Charge {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Charge, 0, len(s.byKey))
+	for _, c := range s.byKey {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
 }
 
 // Reset clears all state, used between test cases.

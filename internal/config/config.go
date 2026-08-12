@@ -104,6 +104,11 @@ type Kafka struct {
 	// ClientID identifies this service in broker-side metrics and logs.
 	ClientID    string
 	DialTimeout time.Duration
+
+	// TopicPrefix namespaces every topic. Empty in production, where the plain
+	// names are wanted; set to isolate a run sharing a broker with others, so a
+	// demo or a staging environment cannot consume work meant for someone else.
+	TopicPrefix string
 }
 
 type Log struct {
@@ -158,6 +163,7 @@ func Load() (*Config, error) {
 			Brokers:     l.csv("KAFKA_BROKERS", []string{"localhost:9092"}),
 			ClientID:    l.str("KAFKA_CLIENT_ID", "payment-orchestrator"),
 			DialTimeout: l.duration("KAFKA_DIAL_TIMEOUT", 10*time.Second),
+			TopicPrefix: l.str("KAFKA_TOPIC_PREFIX", ""),
 		},
 
 		Log: Log{

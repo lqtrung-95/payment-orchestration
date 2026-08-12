@@ -116,6 +116,17 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	if err := messaging.EnsureTopics(ctx, producerClient, topics); err != nil {
 		t.Fatalf("ensure topics: %v", err)
 	}
+
+	// Registered after the client's own cleanup so it runs before it: cleanups
+	// are LIFO. Every run provisions its own topics, and without this a
+	// development broker accumulates thousands of partitions across runs until
+	// metadata handling slows down enough to look like test flakiness.
+	t.Cleanup(func() {
+		deleteCtx, cancelDelete := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancelDelete()
+		_, _ = kadm.NewClient(producerClient).DeleteTopics(deleteCtx, topics.All()...)
+	})
+
 	producer := messaging.NewProducer(producerClient)
 
 	// The ingest endpoint is stood up before the provider, because the provider

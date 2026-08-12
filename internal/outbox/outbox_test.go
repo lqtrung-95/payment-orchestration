@@ -55,6 +55,16 @@ func newPublisher(db *postgres.DB, broker outbox.Broker) *outbox.Publisher {
 	return outbox.NewPublisher(db, broker, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+// pendingRows counts unpublished rows without a *testing.T, so it is safe to
+// call from the publisher goroutines — t.Fatalf from a non-test goroutine does
+// not do what it looks like it does.
+func pendingRows(ctx context.Context, db *postgres.DB) (int, error) {
+	var n int
+	err := db.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM outbox WHERE status = 'pending'`).Scan(&n)
+	return n, err
+}
+
 func countByStatus(t *testing.T, db *postgres.DB, status string) int {
 	t.Helper()
 
@@ -264,18 +274,41 @@ func TestConcurrentPublishersDoNotDuplicate(t *testing.T) {
 		}
 	}
 
+	// Each publisher sweeps until the table is drained rather than a fixed
+	// number of times. A fixed budget makes this test load-sensitive: sweeps
+	// that race and claim nothing still consume it, so under a loaded machine
+	// the publishers can run out of turns with rows still pending — which reads
+	// as "work was dropped" when nothing was dropped at all.
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			p := newPublisher(db, broker)
-			for j := 0; j < 5; j++ {
-				if _, err := p.Sweep(ctx); err != nil {
+			deadline := time.Now().Add(30 * time.Second)
+
+			for time.Now().Before(deadline) {
+				n, err := p.Sweep(ctx)
+				if err != nil {
 					t.Errorf("sweep: %v", err)
 					return
 				}
+				if n > 0 {
+					continue
+				}
+				// Nothing claimable. Either the work is finished, or another
+				// publisher holds the remaining rows under a lease.
+				pending, err := pendingRows(ctx, db)
+				if err != nil {
+					t.Errorf("count pending: %v", err)
+					return
+				}
+				if pending == 0 {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
 			}
+			t.Error("publisher did not drain the outbox within 30s")
 		}()
 	}
 	wg.Wait()

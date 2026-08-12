@@ -49,6 +49,7 @@ func (s *Server) routes() {
 	// in for the customer completing a challenge out of band.
 	s.mux.HandleFunc("POST /v1/simulate/complete", s.handleComplete)
 
+	s.mux.HandleFunc("GET /admin/charges", s.handleListCharges)
 	s.mux.HandleFunc("GET /admin/faults", s.handleGetFaults)
 	s.mux.HandleFunc("PUT /admin/faults", s.handleSetFaults)
 	s.mux.HandleFunc("PUT /admin/faults/preset", s.handleSetPreset)

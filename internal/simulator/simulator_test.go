@@ -307,3 +307,53 @@ func TestOutOfOrderWebhookFaultDeliversAStaleEventLast(t *testing.T) {
 		t.Errorf("last delivered sequence %d is not lower than an earlier %d", last.Sequence, maxEarlier)
 	}
 }
+
+// The admin charge list is what makes "the customer was charged exactly once"
+// checkable from outside this process. A claim that can only be verified by an
+// in-process test is one nobody watching a demo has any reason to believe.
+func TestAdminChargesReportsWhatTheProviderDid(t *testing.T) {
+	cfg, _ := simulator.Preset(simulator.PresetHealthy, 7)
+	srv, _, _, _ := newHarness(t, cfg)
+	client := srv.Client()
+
+	count := func() int {
+		resp, err := client.Get(srv.URL + "/admin/charges")
+		if err != nil {
+			t.Fatalf("get charges: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var body struct {
+			Count   int                `json:"count"`
+			Charges []simulator.Charge `json:"charges"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode charges: %v", err)
+		}
+		if body.Count != len(body.Charges) {
+			t.Fatalf("count %d disagrees with %d listed charges", body.Count, len(body.Charges))
+		}
+		return body.Count
+	}
+
+	if got := count(); got != 0 {
+		t.Fatalf("charges before any request = %d, want 0", got)
+	}
+
+	authorize(t, client, srv.URL, "admin-key-1", simulator.ModeSync, 5000)
+	if got := count(); got != 1 {
+		t.Errorf("charges after one authorize = %d, want 1", got)
+	}
+
+	// The same key again is a replay, not a second charge — which is the exact
+	// property the demo asserts against this endpoint.
+	authorize(t, client, srv.URL, "admin-key-1", simulator.ModeSync, 5000)
+	if got := count(); got != 1 {
+		t.Errorf("charges after a replayed key = %d, want 1", got)
+	}
+
+	authorize(t, client, srv.URL, "admin-key-2", simulator.ModeSync, 5000)
+	if got := count(); got != 2 {
+		t.Errorf("charges after a second key = %d, want 2", got)
+	}
+}

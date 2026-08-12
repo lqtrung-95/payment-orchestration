@@ -16,3 +16,6 @@ coverage.html
 .idea/
 .vscode/
 .DS_Store
+
+# Process logs from scripts/demo.sh.
+.demo-logs/

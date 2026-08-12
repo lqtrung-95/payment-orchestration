@@ -90,6 +90,20 @@ pspsim: ## Run the fault-injecting provider simulator (separate process)
 replay: ## Re-evaluate the stored webhook log against current state (writes nothing)
 	go run ./cmd/webhookctl replay -v
 
+.PHONY: charges
+charges: ## Show what the simulated provider believes it charged
+	@curl -s $(PSPSIM_URL)/admin/charges | jq '{count, charges: [.charges[] | {reference, status, amount_minor}]}'
+
+# --- Demo ------------------------------------------------------------------
+
+.PHONY: demo
+demo: ## Run the narrated end-to-end demo (starts and stops everything itself)
+	./scripts/demo.sh
+
+.PHONY: demo-verify
+demo-verify: ## Run the demo with no pauses and assert every claim
+	./scripts/demo.sh --fast
+
 .PHONY: faults
 faults: ## Show the simulator's current fault configuration
 	@curl -s $(PSPSIM_URL)/admin/faults

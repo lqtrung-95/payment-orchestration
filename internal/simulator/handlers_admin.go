@@ -126,6 +126,19 @@ func (s *Server) handleOutage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"outage_until": until})
 }
 
+// handleListCharges exposes what the provider believes it did.
+//
+// A real provider has a dashboard; this is that. Without it, "the customer was
+// charged exactly once" is only checkable from inside a Go test, which means
+// nobody watching a demo has any reason to believe it.
+func (s *Server) handleListCharges(w http.ResponseWriter, _ *http.Request) {
+	charges := s.store.List()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(charges),
+		"charges": charges,
+	})
+}
+
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.store.Reset()
 	s.hooks.Reset()

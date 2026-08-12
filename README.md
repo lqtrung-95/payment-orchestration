@@ -20,6 +20,11 @@ is a CRUD app; the failure paths are the actual problem.
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
 
+![End-to-end demo](docs/demo.gif)
+
+*`make demo` — seven scenarios against a provider that fails on purpose. Every
+claim it narrates is asserted, and it exits non-zero if any stops holding.*
+
 ---
 
 ## The guarantees, and what enforces them
@@ -288,6 +293,28 @@ tests that existed at the time:
 ## Try it
 
 Requires Go 1.26+ and a container runtime.
+
+The fastest path is the narrated demo. It starts the stack, the provider
+simulator, the API, and a worker; walks through seven scenarios; and tears
+everything down:
+
+```bash
+make demo
+```
+
+Every claim it narrates is asserted, and it exits non-zero if any of them stops
+holding — `make demo-verify` runs it without the pauses. A demo nobody verifies
+rots silently, and the worst place to find that out is on camera.
+
+The recording above was produced from that same script, so it cannot drift from
+what the code actually does:
+
+```bash
+asciinema rec docs/demo.cast --overwrite --idle-time-limit 2 -c "make demo"
+agg --theme monokai --font-size 16 --speed 1.2 docs/demo.cast docs/demo.gif
+```
+
+To drive it by hand instead:
 
 ```bash
 cp .env.example .env

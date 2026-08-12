@@ -123,12 +123,15 @@ func run() error {
 	}
 	defer producerClient.Close()
 
-	if err := messaging.EnsureTopics(ctx, producerClient, messaging.DefaultTopics()); err != nil {
+	// PrefixedTopics with an empty prefix is exactly DefaultTopics, so the
+	// production path is unchanged and a namespaced run needs no separate branch.
+	topics := messaging.PrefixedTopics(cfg.Kafka.TopicPrefix, 0)
+	if err := messaging.EnsureTopics(ctx, producerClient, topics); err != nil {
 		return err
 	}
 
 	paymentService := payment.NewService(db, txstore.NewRepository(), providers,
-		outbox.NewWriter(), messaging.DefaultTopics(), logger)
+		outbox.NewWriter(), topics, logger)
 
 	// The relay runs alongside the API. It is safe to run in every instance —
 	// the claim query uses FOR UPDATE SKIP LOCKED, so instances take disjoint
@@ -147,7 +150,7 @@ func run() error {
 		webhookproviders.NewSimulator(cfg.Webhook.Provider, cfg.Webhook.Secret),
 	)
 	ingestor := webhook.NewIngestor(db, webhookRegistry, webhook.NewRepository(),
-		outbox.NewWriter(), messaging.DefaultTopics(), logger)
+		outbox.NewWriter(), topics, logger)
 
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,

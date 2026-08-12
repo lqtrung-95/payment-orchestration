@@ -75,7 +75,9 @@ func run() error {
 	}
 	defer producerClient.Close()
 
-	topics := messaging.DefaultTopics()
+	// PrefixedTopics with an empty prefix is exactly DefaultTopics, so the
+	// production path is unchanged and a namespaced run needs no separate branch.
+	topics := messaging.PrefixedTopics(cfg.Kafka.TopicPrefix, 0)
 	if err := messaging.EnsureTopics(ctx, producerClient, topics); err != nil {
 		return err
 	}

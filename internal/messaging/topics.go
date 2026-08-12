@@ -5,11 +5,13 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -194,8 +196,13 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, topics Topics) error 
 		}
 		// Replication factor 1 suits a single-broker development cluster; a
 		// deployed cluster would raise this and set min.insync.replicas.
+		//
+		// "Already exists" is success, not failure, and it has to be tolerated on
+		// both the returned error and the per-topic one. The ListTopics check
+		// above is inherently racy: two instances starting together — the normal
+		// case on a deploy — both see the topic missing and both try to create it.
 		resp, err := admin.CreateTopic(ctx, partitions, 1, nil, topic)
-		if err != nil {
+		if err != nil && !isTopicExists(err) {
 			return fmt.Errorf("create topic %s: %w", topic, err)
 		}
 		if resp.Err != nil && !isTopicExists(resp.Err) {
@@ -208,6 +215,15 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, topics Topics) error 
 
 // isTopicExists reports whether the error is a benign "already created" race
 // between two instances starting at once.
+//
+// Matched on the broker's error code rather than its text; the string check is
+// only a fallback for wrappers that lose the typed error.
 func isTopicExists(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists")
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kerr.TopicAlreadyExists) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
