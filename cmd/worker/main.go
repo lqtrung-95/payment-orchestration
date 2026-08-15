@@ -73,11 +73,18 @@ func run() error {
 		}
 	}()
 
-	db, err := postgres.New(ctx, cfg.Postgres)
+	shards, err := postgres.NewRouter(ctx, cfg.Postgres, cfg.Postgres.ShardDSNs)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer shards.Close()
+	// The consumer's deduplication index and the webhook log are global: a
+	// message's event id carries no merchant, and webhook events arrive before
+	// any payment has been resolved from them. One unique constraint deciding
+	// "already handled" for every message is worth the concentration on shard 0;
+	// a per-shard dedup table could not answer for a message whose merchant is
+	// not yet known.
+	db := shards.Global()
 
 	producerClient, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Kafka.Brokers...),
@@ -116,7 +123,7 @@ func run() error {
 		}),
 	)
 
-	service := payment.NewService(db, txstore.NewRepository(), providers, outbox.NewWriter(), topics, logger)
+	service := payment.NewService(shards, txstore.NewRepository(), providers, outbox.NewWriter(), topics, logger)
 
 	breakers := map[string]*resilience.CircuitBreaker{
 		"default": resilience.NewCircuitBreaker(cfg.PSP.DefaultProvider, resilience.DefaultCircuitConfig()),

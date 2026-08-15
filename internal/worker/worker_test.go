@@ -80,7 +80,8 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	t.Helper()
 
 	brokers := kafkaBrokers(t)
-	db := testsupport.FreshDB(t)
+	router := testsupport.FreshRouter(t, 1)
+	db := router.Global()
 	logger := testLogger()
 
 	cfg, _ := simulator.Preset(simulator.PresetHealthy, 20260811)
@@ -144,7 +145,7 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 		Name: "psp-test", BaseURL: sim.URL,
 		Mode: opts.mode, Timeout: 300 * time.Millisecond,
 	})
-	service := payment.NewService(db, txstore.NewRepository(),
+	service := payment.NewService(router, txstore.NewRepository(),
 		psp.NewRegistry("psp-test", adapter), outbox.NewWriter(), topics, logger)
 
 	breakers := map[string]*resilience.CircuitBreaker{
@@ -153,10 +154,10 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	dedup := worker.NewDedup(group)
 	processor := webhook.NewProcessor(db, registry, events, txstore.NewRepository(), logger)
 
-	router := worker.NewRouter(db, producer, topics, dedup, logger)
-	router.Register(topics.Authorize,
+	msgRouter := worker.NewRouter(db, producer, topics, dedup, logger)
+	msgRouter.Register(topics.Authorize,
 		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, logger).Handle)
-	router.Register(topics.Webhook,
+	msgRouter.Register(topics.Webhook,
 		worker.NewWebhookHandler(db, processor, producer, topics, dedup, logger).Handle)
 
 	consumer, err := messaging.NewConsumer(brokers, group, "test-consumer-"+run, topics.Consumed(), logger)
@@ -169,7 +170,7 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	publisher := outbox.NewPublisher(db, producer, outbox.DefaultPublisherConfig(), logger)
 
 	go func() { _ = publisher.Run(ctx) }()
-	go func() { _ = consumer.Run(ctx, router.Handle) }()
+	go func() { _ = consumer.Run(ctx, msgRouter.Handle) }()
 
 	return &pipeline{
 		db: db, service: service, store: store, engine: engine,

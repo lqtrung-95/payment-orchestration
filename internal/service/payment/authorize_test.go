@@ -40,7 +40,8 @@ type harness struct {
 func newHarness(t *testing.T, mode string, faults map[simulator.Fault]float64) *harness {
 	t.Helper()
 
-	db := testsupport.FreshDB(t)
+	router := testsupport.FreshRouter(t, 1)
+	db := router.Global()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cfg, _ := simulator.Preset(simulator.PresetHealthy, 20260811)
@@ -64,7 +65,7 @@ func newHarness(t *testing.T, mode string, faults map[simulator.Fault]float64) *
 
 	return &harness{
 		db:      db,
-		service: payment.NewService(db, txstore.NewRepository(), psp.NewRegistry("psp-test", adapter), outbox.NewWriter(), messaging.DefaultTopics(), logger),
+		service: payment.NewService(router, txstore.NewRepository(), psp.NewRegistry("psp-test", adapter), outbox.NewWriter(), messaging.DefaultTopics(), logger),
 		store:   store,
 		engine:  engine,
 		sim:     sim,
@@ -131,7 +132,7 @@ func (h *harness) create(t *testing.T, key string, amountMinor int64) *domain.Tr
 		t.Fatalf("Create returned error: %v", err)
 	}
 
-	authorized, _ := h.service.Authorize(ctx, tx.ID)
+	authorized, _ := h.service.Authorize(ctx, tx.MerchantID, tx.ID)
 	if authorized != nil {
 		return authorized
 	}
@@ -330,7 +331,7 @@ func TestRepeatedAuthorizationsCollapseToOneCharge(t *testing.T) {
 	// Drive the transaction back to a state from which authorization is legal,
 	// then attempt it again. The provider must not see a second charge.
 	for i := 0; i < 3; i++ {
-		if _, err := h.service.Authorize(ctx, tx.ID); err != nil && !errors.Is(err, domain.ErrIllegalTransition) {
+		if _, err := h.service.Authorize(ctx, tx.MerchantID, tx.ID); err != nil && !errors.Is(err, domain.ErrIllegalTransition) {
 			t.Logf("attempt %d returned: %v", i, err)
 		}
 	}

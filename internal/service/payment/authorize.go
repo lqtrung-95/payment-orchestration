@@ -46,10 +46,27 @@ const statusRecheckDelay = 150 * time.Millisecond
 // non-nil error, because the outcome is recorded in the transaction's state.
 // A nil transaction means something infrastructural failed and nothing can be
 // concluded about the payment at all.
-func (s *Service) Authorize(ctx context.Context, transactionID uuid.UUID) (*domain.Transaction, error) {
-	t, err := s.txRepo.Get(ctx, s.db.Pool(), transactionID)
+//
+// The merchant is a parameter rather than something looked up, because looking
+// it up would require the row this call is on its way to fetch. Sharding makes
+// the owning merchant part of a payment's address, so the message that asks for
+// an authorization has to carry it.
+func (s *Service) Authorize(ctx context.Context, merchantID string, transactionID uuid.UUID) (*domain.Transaction, error) {
+	db, err := s.shardOf(merchantID)
 	if err != nil {
 		return nil, err
+	}
+
+	t, err := s.txRepo.Get(ctx, db.Pool(), transactionID)
+	if err != nil {
+		return nil, err
+	}
+	if t.MerchantID != merchantID {
+		// The row was found on the merchant's shard but belongs to someone
+		// else, which means a shard key was derived from one merchant and the
+		// row written under another. Refusing is the only safe answer: the
+		// alternative is authorising a stranger's payment.
+		return nil, ErrNotFound
 	}
 
 	adapter, err := s.providers.Default()
@@ -231,7 +248,7 @@ func (s *Service) transition(ctx context.Context, t *domain.Transaction, target 
 		return err
 	}
 
-	return s.db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	return s.router.WithTx(ctx, t.ShardKey, func(ctx context.Context, tx pgx.Tx) error {
 		if err := s.txRepo.Update(ctx, tx, t); err != nil {
 			return err
 		}
@@ -248,7 +265,7 @@ func (s *Service) transition(ctx context.Context, t *domain.Transaction, target 
 // persist writes the aggregate without a state change, used when a provider
 // response updates references but leaves the transaction where it was.
 func (s *Service) persist(ctx context.Context, t *domain.Transaction) error {
-	return s.db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	return s.router.WithTx(ctx, t.ShardKey, func(ctx context.Context, tx pgx.Tx) error {
 		return s.txRepo.Update(ctx, tx, t)
 	})
 }

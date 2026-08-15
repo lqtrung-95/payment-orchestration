@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/sharding"
 	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
 )
 
@@ -32,7 +33,13 @@ const (
 // The response is recorded afterwards so a retry can be answered identically —
 // including a failure. A caller that received a decline and retries the same
 // key is entitled to that decline, not to a second attempt at the instrument.
-func Idempotency(db *postgres.DB, repo *idempotency.Repository, logger *slog.Logger) app.HandlerFunc {
+//
+// The claim is stored on the merchant's own shard, alongside the payment it
+// guards. Keeping them together means a shard outage takes both out at once,
+// rather than leaving the in-flight lock reachable while the payment it
+// protects is not — which would answer retries with "still processing" for a
+// payment nothing can advance.
+func Idempotency(router *postgres.Router, repo *idempotency.Repository, logger *slog.Logger) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		key := string(c.Request.Header.Peek(IdempotencyKeyHeader))
 		if key == "" || len(key) > maxIdempotencyKeyLen {
@@ -52,6 +59,8 @@ func Idempotency(db *postgres.DB, repo *idempotency.Repository, logger *slog.Log
 			return
 		}
 
+		shardKey := sharding.KeyForMerchant(merchantID)
+
 		fingerprint := idempotency.Fingerprint(
 			string(c.Request.Method()),
 			string(c.Request.URI().Path()),
@@ -59,7 +68,7 @@ func Idempotency(db *postgres.DB, repo *idempotency.Repository, logger *slog.Log
 		)
 
 		var claim idempotency.ClaimResult
-		err := db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		err := router.WithTx(ctx, shardKey, func(ctx context.Context, tx pgx.Tx) error {
 			var err error
 			claim, err = repo.Claim(ctx, tx, merchantID, key, fingerprint)
 			return err
@@ -110,7 +119,7 @@ func Idempotency(db *postgres.DB, repo *idempotency.Repository, logger *slog.Log
 		// The token proves this caller still owns the claim. If the claim lapsed
 		// and was taken over mid-request, the write is refused rather than
 		// overwriting the newer owner's result.
-		if err := db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := router.WithTx(ctx, shardKey, func(ctx context.Context, tx pgx.Tx) error {
 			return repo.Complete(ctx, tx, merchantID, key, claim.Record.ClaimToken, status, body, nil)
 		}); err != nil {
 			// The response is already correct and is still returned. What is

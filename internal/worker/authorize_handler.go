@@ -77,7 +77,7 @@ func (h *AuthorizeHandler) authorize(
 			resilience.ErrCircuitOpen)
 	}
 
-	tx, authErr := h.service.Authorize(ctx, payload.TransactionID)
+	tx, authErr := h.service.Authorize(ctx, payload.MerchantID, payload.TransactionID)
 
 	switch {
 	case authErr == nil:

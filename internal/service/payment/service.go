@@ -24,6 +24,7 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
 	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/sharding"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	feestore "github.com/lequoctrung/payment-orchestrator/internal/store/fee"
 	ledgerstore "github.com/lequoctrung/payment-orchestrator/internal/store/ledger"
@@ -33,7 +34,7 @@ import (
 var ErrNotFound = errors.New("payment not found")
 
 type Service struct {
-	db         *postgres.DB
+	router     *postgres.Router
 	txRepo     *txstore.Repository
 	ledgerRepo *ledgerstore.Repository
 	feeRepo    *feestore.Repository
@@ -44,7 +45,7 @@ type Service struct {
 }
 
 func NewService(
-	db *postgres.DB,
+	router *postgres.Router,
 	txRepo *txstore.Repository,
 	providers *psp.Registry,
 	outboxWriter *outbox.Writer,
@@ -52,12 +53,23 @@ func NewService(
 	logger *slog.Logger,
 ) *Service {
 	return &Service{
-		db: db, txRepo: txRepo,
+		router: router, txRepo: txRepo,
 		ledgerRepo: ledgerstore.NewRepository(),
 		feeRepo:    feestore.NewRepository(),
 		providers:  providers,
 		outbox:     outboxWriter, topics: topics, logger: logger,
 	}
+}
+
+// shardOf resolves the database holding a merchant's payments.
+//
+// Reads route by merchant rather than by transaction id, and there is no way to
+// fetch a payment from an id alone. That is the cost sharding actually imposes,
+// and it is paid here rather than hidden behind a fan-out: querying all 64
+// shards for one row would make every lookup as expensive as the largest
+// deployment and would quietly stop being sharded at all.
+func (s *Service) shardOf(merchantID string) (*postgres.DB, error) {
+	return s.router.Shard(sharding.KeyForMerchant(merchantID))
 }
 
 type CreateInput struct {
@@ -90,7 +102,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*domain.Transacti
 	// publishing after the commit loses the work whenever the process dies in
 	// between. Writing both to the same database makes the pair all-or-nothing,
 	// and a separate relay carries it to the broker afterwards.
-	err = s.db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	err = s.router.WithTx(ctx, t.ShardKey, func(ctx context.Context, tx pgx.Tx) error {
 		if err := s.txRepo.Insert(ctx, tx, t); err != nil {
 			return err
 		}
@@ -144,7 +156,12 @@ type AuthorizeRequested struct {
 // one asking for a payment that does not exist. Distinguishing the two would
 // let a caller confirm which transaction identifiers are real.
 func (s *Service) Get(ctx context.Context, merchantID string, id uuid.UUID) (*domain.Transaction, error) {
-	t, err := s.txRepo.Get(ctx, s.db.Pool(), id)
+	db, err := s.shardOf(merchantID)
+	if err != nil {
+		return nil, err
+	}
+
+	t, err := s.txRepo.Get(ctx, db.Pool(), id)
 	if errors.Is(err, txstore.ErrNotFound) {
 		return nil, ErrNotFound
 	}

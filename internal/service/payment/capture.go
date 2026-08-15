@@ -49,7 +49,12 @@ type CaptureInput struct {
 // authorisation and the capture disagree, which is a reconciliation break by
 // construction.
 func (s *Service) Capture(ctx context.Context, in CaptureInput) (*domain.Transaction, error) {
-	t, err := s.txRepo.Get(ctx, s.db.Pool(), in.TransactionID)
+	db, err := s.shardOf(in.MerchantID)
+	if err != nil {
+		return nil, err
+	}
+
+	t, err := s.txRepo.Get(ctx, db.Pool(), in.TransactionID)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +204,7 @@ func (s *Service) recordCapture(
 		return err
 	}
 
-	return s.db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	return s.router.WithTx(ctx, t.ShardKey, func(ctx context.Context, tx pgx.Tx) error {
 		if err := s.txRepo.Update(ctx, tx, t); err != nil {
 			return err
 		}

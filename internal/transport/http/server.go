@@ -23,7 +23,7 @@ import (
 // handlers.
 type Deps struct {
 	Logger          *slog.Logger
-	DB              *postgres.DB
+	Router          *postgres.Router
 	Health          []handler.NamedChecker
 	PaymentService  *payment.Service
 	IdempotencyRepo *idempotency.Repository
@@ -87,7 +87,7 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 	// already idempotent, and requiring a key on it would reject valid requests
 	// while consuming key storage for nothing.
 	v1.POST("/payments",
-		middleware.Idempotency(deps.DB, deps.IdempotencyRepo, deps.Logger),
+		middleware.Idempotency(deps.Router, deps.IdempotencyRepo, deps.Logger),
 		payments.Create,
 	)
 	v1.GET("/payments/:id", payments.Get)
@@ -95,7 +95,7 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 	// Capture carries an idempotency key for the same reason creation does: it
 	// moves money, and a retried request must not take the funds twice.
 	v1.POST("/payments/:id/capture",
-		middleware.Idempotency(deps.DB, deps.IdempotencyRepo, deps.Logger),
+		middleware.Idempotency(deps.Router, deps.IdempotencyRepo, deps.Logger),
 		payments.Capture,
 	)
 

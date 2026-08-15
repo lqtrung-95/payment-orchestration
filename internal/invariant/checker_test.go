@@ -24,9 +24,9 @@ import (
 func newChecker(t *testing.T) (*invariant.Checker, *postgres.DB) {
 	t.Helper()
 
-	db := testsupport.FreshDB(t)
+	router := testsupport.FreshRouter(t, 1)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return invariant.NewChecker(db, metrics.New(), logger), db
+	return invariant.NewChecker(router, metrics.New(), logger), router.Global()
 }
 
 // capturedTransaction walks a transaction to captured. postEntry decides whether

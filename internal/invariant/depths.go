@@ -22,7 +22,7 @@ import (
 // only way to see it was to query Kafka by hand. Depth and lag are what turn
 // that from an archaeology exercise into an alert.
 type DepthSampler struct {
-	db      *postgres.DB
+	router  *postgres.Router
 	admin   *kadm.Client
 	topics  messaging.Topics
 	group   string
@@ -31,7 +31,7 @@ type DepthSampler struct {
 }
 
 func NewDepthSampler(
-	db *postgres.DB,
+	router *postgres.Router,
 	client *kgo.Client,
 	topics messaging.Topics,
 	consumerGroup string,
@@ -43,7 +43,7 @@ func NewDepthSampler(
 		admin = kadm.NewClient(client)
 	}
 	return &DepthSampler{
-		db: db, admin: admin, topics: topics,
+		router: router, admin: admin, topics: topics,
 		group: consumerGroup, metrics: m, logger: logger,
 	}
 }
@@ -56,19 +56,28 @@ func (s *DepthSampler) Sample(ctx context.Context) error {
 	return s.sampleConsumerLag(ctx)
 }
 
-// sampleOutbox reports rows the relay has not yet carried to the broker.
+// sampleOutbox reports rows the relay has not yet carried to the broker,
+// totalled across shards.
 //
 // Sustained growth means the relay is behind or failing; a spike that drains is
 // just a burst. Neither is visible from request metrics, because the API has
 // already returned by the time the row exists.
+//
+// Each shard has its own outbox and its own relay, because the row is written
+// in the same transaction as the domain change and cannot live anywhere else.
+// The gauge is the total: a single shard falling behind still shows as backlog.
 func (s *DepthSampler) sampleOutbox(ctx context.Context) error {
 	const query = `SELECT count(*) FROM outbox WHERE status = 'pending'`
 
-	var pending int
-	if err := s.db.Pool().QueryRow(ctx, query).Scan(&pending); err != nil {
-		return fmt.Errorf("sample outbox depth: %w", err)
+	var total int
+	for shard, db := range s.router.Shards() {
+		var pending int
+		if err := db.Pool().QueryRow(ctx, query).Scan(&pending); err != nil {
+			return fmt.Errorf("sample outbox depth on shard %d: %w", shard, err)
+		}
+		total += pending
 	}
-	s.metrics.OutboxPending.Set(float64(pending))
+	s.metrics.OutboxPending.Set(float64(total))
 	return nil
 }
 

@@ -80,12 +80,17 @@ func run() error {
 		}
 	}()
 
-	db, err := postgres.New(ctx, cfg.Postgres)
+	router, err := postgres.NewRouter(ctx, cfg.Postgres, cfg.Postgres.ShardDSNs)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	logger.InfoContext(ctx, "connected to postgres")
+	defer router.Close()
+	// Tables that no merchant owns — the webhook log, settlement files,
+	// reconciliation breaks — live on shard 0 and are reached through this
+	// handle. Everything merchant-scoped goes through the router instead.
+	db := router.Global()
+	logger.InfoContext(ctx, "connected to postgres",
+		slog.Int("physical_shards", router.Mapping().Physical()))
 
 	rdb, err := redis.New(ctx, cfg.Redis)
 	if err != nil {
@@ -152,19 +157,28 @@ func run() error {
 		return err
 	}
 
-	paymentService := payment.NewService(db, txstore.NewRepository(), providers,
+	paymentService := payment.NewService(router, txstore.NewRepository(), providers,
 		outbox.NewWriter(), topics, logger)
 
 	// The relay runs alongside the API. It is safe to run in every instance —
 	// the claim query uses FOR UPDATE SKIP LOCKED, so instances take disjoint
 	// rows rather than blocking on each other.
-	publisher := outbox.NewPublisher(db, messaging.NewProducer(producerClient),
-		outbox.DefaultPublisherConfig(), logger)
-	go func() {
-		if err := publisher.Run(ctx); err != nil {
-			logger.ErrorContext(ctx, "outbox publisher stopped", slog.Any("error", err))
-		}
-	}()
+	//
+	// One relay per shard, because an outbox row is written in the same
+	// transaction as the domain change that produced it and therefore lives in
+	// that merchant's database. A single relay pointed at one shard would leave
+	// every other shard's events unpublished — payments accepted and then never
+	// acted on, with nothing in the API's own metrics to show it.
+	for i, shard := range router.Shards() {
+		publisher := outbox.NewPublisher(shard, messaging.NewProducer(producerClient),
+			outbox.DefaultPublisherConfig(), logger.With(slog.Int("shard", i)))
+		go func() {
+			if err := publisher.Run(ctx); err != nil {
+				logger.ErrorContext(ctx, "outbox publisher stopped",
+					slog.Int("shard", i), slog.Any("error", err))
+			}
+		}()
+	}
 
 	// One verifier per provider, resolved by the route segment. Adding a real
 	// provider means adding its scheme here, not widening a shared one.
@@ -178,14 +192,14 @@ func run() error {
 	// test that reports throughput while the ledger is quietly unbalanced is a
 	// failed run that looks like a passing one, so the checking has to happen
 	// while the traffic is flowing.
-	checker := invariant.NewChecker(db, meters, logger)
+	checker := invariant.NewChecker(router, meters, logger)
 	go func() {
 		if err := checker.Run(ctx, cfg.Observability.CheckInterval); err != nil {
 			logger.ErrorContext(ctx, "invariant checker stopped", slog.Any("error", err))
 		}
 	}()
 
-	sampler := invariant.NewDepthSampler(db, producerClient, topics,
+	sampler := invariant.NewDepthSampler(router, producerClient, topics,
 		cfg.Observability.ConsumerGroup, meters, logger)
 	go func() {
 		if err := sampler.Run(ctx, cfg.Observability.CheckInterval); err != nil {
@@ -195,9 +209,12 @@ func run() error {
 
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,
-		DB:     db,
+		Router: router,
 		Health: []handler.NamedChecker{
-			{Name: "postgres", Checker: db},
+			// The router, not one pool: a service that reports healthy while
+			// one of its databases is unreachable keeps taking payments for the
+			// merchants it can no longer serve.
+			{Name: "postgres", Checker: router},
 			{Name: "redis", Checker: rdb},
 			{Name: "kafka", Checker: kfk},
 		},

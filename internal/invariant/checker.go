@@ -43,14 +43,20 @@ func (r Result) String() string {
 }
 
 // Checker runs the invariant queries and publishes the results.
+//
+// Every shard is queried and the counts are summed. Each database holds its own
+// merchants' ledger, so a violation on any one of them is a violation of the
+// system — and a checker that looked only at shard 0 would report zero while
+// another database was unbalanced, which is the specific failure these gauges
+// exist to make impossible.
 type Checker struct {
-	db      *postgres.DB
+	router  *postgres.Router
 	metrics *metrics.Metrics
 	logger  *slog.Logger
 }
 
-func NewChecker(db *postgres.DB, m *metrics.Metrics, logger *slog.Logger) *Checker {
-	return &Checker{db: db, metrics: m, logger: logger}
+func NewChecker(router *postgres.Router, m *metrics.Metrics, logger *slog.Logger) *Checker {
+	return &Checker{router: router, metrics: m, logger: logger}
 }
 
 // ledgerImbalanceQuery counts entries whose postings do not net to zero within
@@ -111,17 +117,24 @@ func (c *Checker) Check(ctx context.Context) (Result, error) {
 	started := time.Now()
 	result := Result{CheckedAt: started.UTC()}
 
-	for _, check := range []struct {
-		name  string
-		query string
-		into  *int
-	}{
-		{"ledger imbalance", ledgerImbalanceQuery, &result.LedgerImbalance},
-		{"double charges", doubleChargeQuery, &result.DoubleCharges},
-		{"lost payments", lostPaymentQuery, &result.LostPayments},
-	} {
-		if err := c.db.Pool().QueryRow(ctx, check.query).Scan(check.into); err != nil {
-			return Result{}, fmt.Errorf("%s check: %w", check.name, err)
+	for shard, db := range c.router.Shards() {
+		for _, check := range []struct {
+			name  string
+			query string
+			into  *int
+		}{
+			{"ledger imbalance", ledgerImbalanceQuery, &result.LedgerImbalance},
+			{"double charges", doubleChargeQuery, &result.DoubleCharges},
+			{"lost payments", lostPaymentQuery, &result.LostPayments},
+		} {
+			var count int
+			if err := db.Pool().QueryRow(ctx, check.query).Scan(&count); err != nil {
+				// A shard that cannot be read is reported as an error rather
+				// than as zero. Publishing "no violations" when a database was
+				// unreachable is the one answer these gauges must never give.
+				return Result{}, fmt.Errorf("%s check on shard %d: %w", check.name, shard, err)
+			}
+			*check.into += count
 		}
 	}
 
