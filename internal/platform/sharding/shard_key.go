@@ -19,6 +19,14 @@ import (
 // constant would relocate live data and break that property.
 const LogicalShards = 64
 
+// Shard keys are stored as a fixed-width string — s00 through s63 — rather than
+// an integer. Fixed width keeps them sortable and range-scannable as text, and
+// the prefix makes a stray shard key obvious in a log line or a query plan.
+const (
+	shardKeyPrefix = "s"
+	shardKeyDigits = 2
+)
+
 // KeyForMerchant derives the shard key from a merchant identifier.
 //
 // Merchant is the partition dimension because merchant-scoped reads dominate
@@ -35,5 +43,5 @@ func KeyForMerchant(merchantID string) string {
 	h := fnv.New64a()
 	// Hash.Write never returns an error, per the hash.Hash contract.
 	_, _ = h.Write([]byte(merchantID))
-	return fmt.Sprintf("s%02d", h.Sum64()%LogicalShards)
+	return fmt.Sprintf("%s%0*d", shardKeyPrefix, shardKeyDigits, h.Sum64()%LogicalShards)
 }

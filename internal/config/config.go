@@ -9,6 +9,8 @@ package config
 import (
 	"fmt"
 	"time"
+
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/sharding"
 )
 
 type Config struct {
@@ -102,6 +104,18 @@ type HTTP struct {
 
 type Postgres struct {
 	DSN string
+
+	// ShardDSNs lists one DSN per physical database, in physical shard order.
+	// Unset means a single database holding all 64 logical shards, which is the
+	// normal small deployment and is exactly what the service ran as before
+	// routing existed.
+	//
+	// The order is part of the deployment contract, not a convenience:
+	// reordering the list reassigns every merchant to a different database
+	// while their rows stay where they are. Growing the list is a data
+	// migration, never a config-only change — the config change is the second
+	// half of it, after the rows have moved.
+	ShardDSNs []string
 	// MaxConns caps the pool. Sized against Postgres max_connections divided by
 	// the number of service instances; oversizing turns a traffic spike into
 	// connection exhaustion at the database rather than backpressure here.
@@ -165,6 +179,7 @@ func Load() (*Config, error) {
 
 		Postgres: Postgres{
 			DSN:               l.required("POSTGRES_DSN"),
+			ShardDSNs:         l.csv("POSTGRES_SHARD_DSNS", nil),
 			MaxConns:          int32(l.int("POSTGRES_MAX_CONNS", 20)),
 			MinConns:          int32(l.int("POSTGRES_MIN_CONNS", 2)),
 			MaxConnLifetime:   l.duration("POSTGRES_MAX_CONN_LIFETIME", time.Hour),
@@ -215,6 +230,19 @@ func Load() (*Config, error) {
 			TracingEndpoint:  l.str("TRACING_ENDPOINT", "localhost:4317"),
 			TraceSampleRatio: l.float("TRACE_SAMPLE_RATIO", 1.0),
 		},
+	}
+
+	// A single unsharded database is the same thing as one physical shard, so
+	// the rest of the service only ever deals with the list and never has to ask
+	// whether sharding is "on".
+	if len(cfg.Postgres.ShardDSNs) == 0 {
+		cfg.Postgres.ShardDSNs = []string{cfg.Postgres.DSN}
+	}
+	// Rejected at boot rather than at the first routed query: a count the
+	// mapping cannot express would otherwise strand every merchant whose shard
+	// falls outside the ranges it can produce.
+	if _, err := sharding.NewMapping(len(cfg.Postgres.ShardDSNs)); err != nil {
+		l.fail("POSTGRES_SHARD_DSNS", err.Error())
 	}
 
 	if err := l.err(); err != nil {
