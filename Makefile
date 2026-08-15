@@ -117,9 +117,9 @@ load-chaos: ## Ramping load run with the full fault catalogue live
 	k6 run -e PROFILE=chaos -e RUN_ID=$(RUN_ID) loadtest/payments.js
 
 .PHONY: invariants
-invariants: ## Show the three must-be-zero counters
+invariants: ## Show the must-be-zero counters and the queue depths
 	@curl -s http://localhost:8080/metrics \
-		| grep -E '^payment_(double_charges|lost_payments|ledger_imbalance) '
+		| grep -E '^payment_(double_charges|lost_payments|ledger_imbalance|outbox_pending|dlq_depth) '
 
 # --- Demo ------------------------------------------------------------------
 

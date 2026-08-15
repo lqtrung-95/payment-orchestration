@@ -62,12 +62,16 @@ func (w *Writer) Enqueue(ctx context.Context, q postgres.Querier, msg Message) (
 		return uuid.Nil, fmt.Errorf("marshal outbox payload: %w", err)
 	}
 
+	// The caller's trace context is stored with the message, so the relay can
+	// publish inside the trace that caused the write rather than starting a new
+	// one. See tracing.go.
 	const query = `
-		INSERT INTO outbox (event_id, aggregate_id, partition_key, topic, payload)
-		VALUES ($1, $2, $3, $4, $5)`
+		INSERT INTO outbox (event_id, aggregate_id, partition_key, topic, payload, traceparent)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))`
 
 	if _, err := q.Exec(ctx, query,
 		msg.EventID, msg.AggregateID, msg.PartitionKey, msg.Topic, payload,
+		traceparentFrom(ctx),
 	); err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue outbox message: %w", err)
 	}
@@ -85,4 +89,8 @@ type Record struct {
 	Payload      []byte
 	Attempts     int
 	CreatedAt    time.Time
+
+	// Traceparent is the W3C trace context active when the message was
+	// enqueued, so the publish rejoins that trace instead of orphaning itself.
+	Traceparent string
 }

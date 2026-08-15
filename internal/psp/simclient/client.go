@@ -19,9 +19,16 @@ import (
 	"net/url"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 )
+
+var tracer = otel.Tracer("payment-orchestrator/psp")
 
 // Config describes one simulated provider. Several instances point at the same
 // simulator process with different modes, which is how one binary presents
@@ -104,7 +111,7 @@ func (c *Client) GetStatus(ctx context.Context, req psp.StatusRequest) (*psp.Res
 	if err != nil {
 		return nil, psp.NewError(c.cfg.Name, psp.ClassUnknown, "", "build status request", err)
 	}
-	return c.do(httpReq)
+	return c.traced(ctx, "status", httpReq)
 }
 
 func (c *Client) post(ctx context.Context, path, idempotencyKey string, body chargeRequest) (*psp.Response, error) {
@@ -121,7 +128,40 @@ func (c *Client) post(ctx context.Context, path, idempotencyKey string, body cha
 	httpReq.Header.Set("Idempotency-Key", idempotencyKey)
 	httpReq.Header.Set("X-Sim-Mode", c.cfg.Mode)
 
-	return c.do(httpReq)
+	return c.traced(ctx, path, httpReq)
+}
+
+// traced wraps a provider call in a client span.
+//
+// The provider is where the interesting time goes and where the interesting
+// failures happen, so this is the span that makes a slow or hanging payment
+// legible. The idempotency key is recorded because it is what a duplicate
+// investigation is actually keyed on; the amount and any instrument detail are
+// deliberately not, because a tracing backend is usually readable by more
+// people than the database is.
+func (c *Client) traced(ctx context.Context, operation string, httpReq *http.Request) (*psp.Response, error) {
+	ctx, span := tracer.Start(ctx, "psp "+c.cfg.Name+" "+operation,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("psp.provider", c.cfg.Name),
+			attribute.String("psp.operation", operation),
+			attribute.String("psp.mode", c.cfg.Mode),
+			attribute.String("psp.idempotency_key", httpReq.Header.Get("Idempotency-Key")),
+		))
+	defer span.End()
+
+	resp, err := c.do(httpReq.WithContext(ctx))
+	if err != nil {
+		// The normalized class is the attribute worth having: it is what the
+		// retry policy keys on, so a trace shows not just that the call failed
+		// but what the system concluded from the failure.
+		span.SetAttributes(attribute.String("psp.error_class", string(psp.ClassOf(err))))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "provider call failed")
+		return nil, err
+	}
+	span.SetAttributes(attribute.String("psp.status", string(resp.Status)))
+	return resp, nil
 }
 
 func (c *Client) do(httpReq *http.Request) (*psp.Response, error) {

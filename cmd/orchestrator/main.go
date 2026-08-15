@@ -62,6 +62,24 @@ func run() error {
 
 	logger.InfoContext(ctx, "starting service", slog.String("env", cfg.Env), slog.String("addr", cfg.HTTP.Addr))
 
+	// Tracing is installed before anything else does work, so every span
+	// created below has a real provider to attach to rather than the no-op one.
+	tracing, err := telemetry.StartTracing(ctx, telemetry.TracingConfig{
+		Enabled:     cfg.Observability.TracingEnabled,
+		ServiceName: "payment-orchestrator",
+		Environment: cfg.Env,
+		Endpoint:    cfg.Observability.TracingEndpoint,
+		SampleRatio: cfg.Observability.TraceSampleRatio,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := tracing.Shutdown(ctx); err != nil {
+			logger.Error("flush traces", slog.Any("error", err))
+		}
+	}()
+
 	db, err := postgres.New(ctx, cfg.Postgres)
 	if err != nil {
 		return err

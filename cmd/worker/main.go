@@ -55,6 +55,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing is installed before anything else does work, so every span
+	// created below has a real provider to attach to rather than the no-op one.
+	tracing, err := telemetry.StartTracing(ctx, telemetry.TracingConfig{
+		Enabled:     cfg.Observability.TracingEnabled,
+		ServiceName: "payment-worker",
+		Environment: cfg.Env,
+		Endpoint:    cfg.Observability.TracingEndpoint,
+		SampleRatio: cfg.Observability.TraceSampleRatio,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := tracing.Shutdown(ctx); err != nil {
+			logger.Error("flush traces", slog.Any("error", err))
+		}
+	}()
+
 	db, err := postgres.New(ctx, cfg.Postgres)
 	if err != nil {
 		return err

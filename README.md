@@ -17,7 +17,8 @@ is a CRUD app; the failure paths are the actual problem.
 > with deduplication and out-of-order tolerance, capture posting to a
 > double-entry ledger, and settlement reconciliation with an eight-category
 > break taxonomy.
-> Sharding, observability, and load testing are not built yet.
+> Metrics, distributed tracing, a continuous invariant checker, and measured
+> load numbers are in. Sharding is not built.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -252,7 +253,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 162 tests, green in
+Measured on this repo, not projected. 170 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -342,6 +343,45 @@ that always returned zero would pass every load test ever run against it.
 
 No throughput figure accompanies this, on purpose —
 [`docs/benchmarks/`](docs/benchmarks/) explains why.
+
+**Under load, with the provider failing ~30% of requests** — measured, not
+projected; hardware and commands in [`docs/benchmarks/`](docs/benchmarks/README.md):
+
+```
+accepted                 453 req/s
+server errors            0  of 55,767
+double charges           0
+lost payments            0
+ledger imbalance         0
+provider charges         177, against 177 transactions that reached it
+```
+
+The invariants were exported *during* the run by a checker that runs on a
+timer, not computed afterwards. A throughput number measured while correctness
+was silently broken is a failed run that looks like a passing one — and there
+are tests that plant a violation to prove the checker actually notices.
+
+The same run found the real limit: **ingestion scales, processing does not.**
+55,590 payments sat at `created` behind 42,409 pending outbox rows, because the
+worker consumes with one goroutine making synchronous provider calls. That is
+correct queue behaviour — accept durably, drain at the downstream's pace — but
+the drain rate is not horizontal, and it is now two gauges instead of an
+archaeology exercise.
+
+**One trace, two processes, both boundaries crossed:**
+
+```
+payment-orchestrator  POST /v1/payments                     59ms
+payment-orchestrator  kafka.publish payment.authorize       10ms
+payment-worker        kafka.consume payment.authorize       37ms
+payment-worker        psp psp-async-sim /v1/charges/authorize 2ms
+```
+
+Crossing Kafka needs the trace context in record headers. Crossing the *outbox*
+needs it in the database row — the handler commits and returns while the relay
+publishes later in another goroutine, so without a stored `traceparent` the
+trace starts at the relay and the request that caused the payment is missing
+from its own story.
 
 **Webhooks under chaos** — 30 payments against the asynchronous provider with
 every webhook fault live, so the outcome could only ever arrive by callback:
@@ -519,6 +559,7 @@ internal/
   outbox/     transactional outbox writer and relay
   messaging/  Kafka topics, producer, consumer group with partition-level deferral
   fx/         fixed-point rates, locks, conversion  (domain/fx)
+  invariant/  continuous must-be-zero checks, queue depth and consumer lag
   recon/      settlement parsing, matching, the break taxonomy, resolution
   webhook/    ingest, per-provider verifiers, guarded processor, replay
   worker/     queue handlers, router, dedup

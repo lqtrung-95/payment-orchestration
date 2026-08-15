@@ -165,6 +165,72 @@ obvious suspect for a hundredfold median-to-p99 spread.
   not yet incremented from their call sites; only HTTP, the invariants, and the
   depths are wired.
 
+## Measured on 2026-08-16
+
+Full numbers, hardware, and commands in [`docs/benchmarks/`](../../docs/benchmarks/README.md).
+
+| Run | Result |
+|---|---|
+| Steady 200 req/s, healthy | 192 req/s, median 7.7ms, p99 1.73s, 0 errors |
+| Ramp to 1,000 req/s, healthy | 416 req/s sustained, p95 3.28s, 0 errors |
+| Chaos, ~30% fault rate | 453 req/s, 0 server errors in 55,767 requests |
+| Invariants during the chaos run | double charges 0 · lost payments 0 · imbalance 0 |
+| Provider charges vs transactions reaching it | 177 vs 177 |
+
+**One trace spans HTTP → outbox → Kafka → worker → provider**, across two
+processes. Crossing Kafka needs the context in record headers; crossing the
+outbox needs it in the database row, because the handler commits and returns
+while the relay publishes later in another goroutine.
+
+## The finding
+
+**Ingestion scales; processing does not.** At the end of the chaos run the API
+had accepted 55,767 payments and the pipeline had authorised 175, with 42,409
+outbox rows pending and 13,200 messages of consumer lag.
+
+The cause is architectural: the worker consumes with a single goroutine walking
+every assigned partition in order, each message making a synchronous provider
+call. Under injected faults those calls include multi-second hangs, so the drain
+rate collapses to roughly the reciprocal of provider latency however many
+partitions exist.
+
+Accepting durably and draining slowly is the correct behaviour for a queue —
+it is why the outbox exists — but the drain rate is a real limit and it is not
+horizontal. Concurrent per-partition consumers would fix it and are deliberately
+not built: that changes the ordering the retry ladder depends on, and a delay
+tier that stops being ordered by time stops working.
+
+None of this was visible before this phase. The same backlog stalled twenty
+payments during the phase 05 demo and was found by querying Kafka by hand.
+
+## Bugs found
+
+**The outbox relay silently stopped publishing.** Adding `traceparent` to the
+claim query's RETURNING clause without adding the matching Scan destination
+produced `9 fields, 8 destinations` on every sweep. Caught because the phase 04
+work logs every sweep failure rather than only when parking — the failure was
+loud, and the payment simply sat at `created`.
+
+**Schema URL conflict at startup.** `resource.Merge` refuses to combine
+resources built against different semconv versions, so importing v1.26.0
+alongside an SDK on v1.43.0 aborted boot. Correct behaviour, and it surfaced
+immediately rather than as a missing attribute later.
+
+## Deferred
+
+- **No Grafana dashboard.** Prometheus scrapes and the metrics are correct, but
+  the provisioned dashboard JSON is not written, so the story has to be told
+  from raw queries.
+- **No DB spans.** Traces cover HTTP, Kafka, and the provider; individual
+  queries are not instrumented, so a slow statement is invisible in a trace.
+- **Outage, spike, and soak runs.** Profiles exist and were never executed, so
+  nothing is claimed about failover timing, shedding, or leaks.
+- **The plan's targets are not met.** 2,000 req/s at p99 < 150 ms is not close
+  on this hardware, and the honest figures are published instead.
+- **No PSP-level counters wired.** `psp_errors_total`, `payment_declines_total`,
+  `payment_retry_attempts_total`, `webhooks_received_total`, `recon_breaks_total`
+  and the breaker gauge are registered but nothing increments them yet.
+
 ## Next steps
 
 Phase 10 — packaging all of this into artifacts a hiring manager will actually read.

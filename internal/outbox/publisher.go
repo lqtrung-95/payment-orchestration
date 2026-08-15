@@ -119,7 +119,12 @@ func (p *Publisher) Sweep(ctx context.Context) (int, error) {
 
 	published := 0
 	for _, rec := range records {
-		if err := p.broker.Publish(ctx, rec.Topic, rec.PartitionKey, rec.EventID.String(), rec.Payload); err != nil {
+		// Published inside the trace the message was written in, so the request
+		// that caused the payment and the publish that carries it out belong to
+		// one story rather than two.
+		publishCtx := contextFrom(ctx, rec.Traceparent)
+
+		if err := p.broker.Publish(publishCtx, rec.Topic, rec.PartitionKey, rec.EventID.String(), rec.Payload); err != nil {
 			p.markFailed(ctx, rec, err)
 			continue
 		}
@@ -167,7 +172,7 @@ func (p *Publisher) claim(ctx context.Context) ([]Record, error) {
 				LIMIT $1
 				FOR UPDATE SKIP LOCKED
 			)
-			RETURNING id, event_id, aggregate_id, partition_key, topic, payload, attempts, created_at`
+			RETURNING id, event_id, aggregate_id, partition_key, topic, payload, attempts, created_at, COALESCE(traceparent, '')`
 
 		lease := fmt.Sprintf("%d milliseconds", p.cfg.ClaimLease.Milliseconds())
 		rows, err := tx.Query(ctx, query, p.cfg.BatchSize, lease)
@@ -179,7 +184,8 @@ func (p *Publisher) claim(ctx context.Context) ([]Record, error) {
 		for rows.Next() {
 			var rec Record
 			if err := rows.Scan(&rec.ID, &rec.EventID, &rec.AggregateID,
-				&rec.PartitionKey, &rec.Topic, &rec.Payload, &rec.Attempts, &rec.CreatedAt); err != nil {
+				&rec.PartitionKey, &rec.Topic, &rec.Payload, &rec.Attempts, &rec.CreatedAt,
+				&rec.Traceparent); err != nil {
 				return fmt.Errorf("scan outbox row: %w", err)
 			}
 			records = append(records, rec)

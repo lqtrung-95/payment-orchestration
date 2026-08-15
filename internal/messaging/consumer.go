@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Message is a consumed record in the vocabulary handlers work in.
@@ -166,16 +169,33 @@ func (c *Consumer) handlePartition(ctx context.Context, p kgo.FetchTopicPartitio
 			return
 		}
 
-		if err := handler(ctx, msg); err != nil {
+		// The span continues the trace the record was produced in, so the work
+		// the API queued and the work the worker did are one causal story
+		// rather than two unrelated ones.
+		recordCtx, span := tracer.Start(extractTrace(ctx, record),
+			"kafka.consume "+record.Topic,
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "kafka"),
+				attribute.String("messaging.source.name", record.Topic),
+				attribute.String("messaging.message.id", msg.EventID),
+				attribute.Int("messaging.kafka.partition", int(record.Partition)),
+				attribute.Int("payment.retry_attempt", msg.Attempt),
+			))
+
+		if err := handler(recordCtx, msg); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "handler failed")
 			// The handler owns the failure path: by the time it returns an
 			// error it has already routed the message to a retry tier or the
 			// DLQ. Not committing here would replay it forever and stall the
 			// partition behind it.
-			c.logger.ErrorContext(ctx, "handler failed",
+			c.logger.ErrorContext(recordCtx, "handler failed",
 				slog.String("topic", msg.Topic),
 				slog.String("event_id", msg.EventID),
 				slog.Any("error", err))
 		}
+		span.End()
 
 		if err := c.client.CommitRecords(ctx, record); err != nil {
 			// The offset did not advance, so this record is redelivered.

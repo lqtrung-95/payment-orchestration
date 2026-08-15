@@ -34,6 +34,17 @@ type Observability struct {
 	// ConsumerGroup names the group whose lag is reported. It has to match the
 	// worker's, or the lag gauge reports on a group nobody is consuming with.
 	ConsumerGroup string
+
+	// TracingEnabled is off by default. An OTLP exporter with no collector
+	// listening retries in the background forever, and a service that refuses
+	// to start because nothing is on port 4317 is worse than one with no traces.
+	TracingEnabled  bool
+	TracingEndpoint string
+
+	// TraceSampleRatio is the fraction of traces recorded. Full sampling suits
+	// a demo and distorts a load test, where the exporter becomes part of what
+	// is being measured — so every published number states which was used.
+	TraceSampleRatio float64
 }
 
 // Webhook configures the provider-facing ingestion endpoint.
@@ -198,8 +209,11 @@ func Load() (*Config, error) {
 		},
 
 		Observability: Observability{
-			CheckInterval: l.duration("OBSERVABILITY_CHECK_INTERVAL", 5*time.Second),
-			ConsumerGroup: l.str("KAFKA_CONSUMER_GROUP", "payment-workers"),
+			CheckInterval:    l.duration("OBSERVABILITY_CHECK_INTERVAL", 5*time.Second),
+			ConsumerGroup:    l.str("KAFKA_CONSUMER_GROUP", "payment-workers"),
+			TracingEnabled:   l.bool("TRACING_ENABLED", false),
+			TracingEndpoint:  l.str("TRACING_ENDPOINT", "localhost:4317"),
+			TraceSampleRatio: l.float("TRACE_SAMPLE_RATIO", 1.0),
 		},
 	}
 

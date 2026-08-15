@@ -5,7 +5,15 @@ import (
 	"fmt"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer is resolved from the global provider, which is a no-op until tracing
+// is started — so this file behaves identically whether or not it is enabled.
+var tracer = otel.Tracer("payment-orchestrator/messaging")
 
 // HeaderEventID carries the outbox event id through the broker so a consumer
 // can deduplicate without parsing the payload.
@@ -64,7 +72,23 @@ func (p *Producer) PublishWithHeaders(
 		Headers: headers,
 	}
 
+	ctx, span := tracer.Start(ctx, "kafka.publish "+topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", topic),
+			attribute.String("messaging.message.id", eventID),
+		))
+	defer span.End()
+
+	// Injected after the span starts, so the headers carry *this* span as the
+	// parent. Injecting before would propagate whatever was active on the way
+	// in and orphan the publish from the work it caused.
+	injectTrace(ctx, record)
+
 	if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
 		return fmt.Errorf("publish to %s: %w", topic, err)
 	}
 	return nil

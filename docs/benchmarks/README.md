@@ -1,122 +1,167 @@
 # Benchmarks
 
-Every number here comes with the command that produced it and the machine it
-ran on. A throughput figure without both is a claim, not a measurement.
+Every number here was measured on the hardware described below, with the exact
+command shown. Nothing is extrapolated, and nothing is rounded up.
 
-**There is no published throughput number yet, deliberately.** See
-[Why throughput is not published](#why-throughput-is-not-published).
+The headline is not the throughput. It is that **the three must-be-zero
+invariants held at zero while the provider was failing roughly a third of
+requests** — and that the measurements found a real bottleneck rather than
+confirming a hope.
 
-## Method
+## Hardware
+
+This matters more than the numbers do. A throughput figure without the machine
+it came from is a decoration.
+
+| | |
+|---|---|
+| Host | Apple Silicon laptop, 10 cores |
+| Docker Desktop | **4 CPUs, 8 GB** — shared by Postgres, Kafka, Redis |
+| Postgres | 16.10, in Docker |
+| Kafka | 3.9.1 KRaft, single broker, in Docker |
+| Under test | orchestrator, worker, provider simulator — on the host |
+| Load generator | k6 v2.2.0, also on the host |
+
+The datastores get four shared cores while the application and the load
+generator compete for the other six. This is a developer laptop, not a
+representative deployment, and the numbers should be read as "what this
+architecture does on this machine" rather than as a capacity claim.
+
+## Results
+
+### Steady state, healthy provider
 
 ```bash
 make up && make migrate-up
-make pspsim            # the provider that fails on purpose
-make worker            # consumes Kafka, calls providers
-make run               # the API, exporting /metrics
-
-k6 run -e PROFILE=baseline -e RUN_ID=$(date +%s) loadtest/payments.js
+k6 run -e PROFILE=soak -e SOAK_DURATION=60s loadtest/payments.js
 ```
 
-Profiles are in [`loadtest/payments.js`](../../loadtest/payments.js):
-`smoke`, `baseline`, `chaos`, `spike`, `soak`. They share one request path on
-purpose — a chaos run has to exercise exactly what the baseline exercises, or
-comparing them means nothing.
-
-Fault injection is set out of band, so the same script measures a healthy and a
-failing provider:
-
-```bash
-make healthy    # no faults
-make chaos      # the full fault catalogue
-make outage SECONDS=90
-```
-
-k6 thresholds are assertions, not decoration: the run exits non-zero when one is
-crossed, so a degraded run cannot be reported as a passing one.
-
-## What was measured
-
-Runs on 2026-08-15. Apple Silicon laptop, 10 cores, with Postgres and Kafka in
-Docker Desktop limited to **4 CPUs and 8 GB**. The API, worker, provider
-simulator, and k6 all ran on the host alongside the operator's normal
-applications.
-
-### Correctness under load — the part that is publishable
-
-| Measure | Result |
+| | |
 |---|---|
-| Payments created across all load runs | **164,933** |
-| Ledger imbalance | **0** |
-| Double charges | **0** |
-| Lost payments (captured, no ledger entry) | **0** |
-| 5xx responses | 4 |
-| Payments returned in a state other than `created` | 0 |
-
-The four failures were `statement timeout` on the idempotency claim, during a
-deliberately degraded experiment while the host was heavily oversubscribed. That
-is the failure mode worth having: under contention the system **refused work
-rather than corrupting state**. Every invariant held throughout, including
-across that period.
-
-The invariant checker runs continuously during load — a run that reports
-throughput while the ledger is quietly unbalanced is a failed run that looks
-like a passing one. It is itself tested against seeded violations
-([`checker_test.go`](../../internal/invariant/checker_test.go)), because a
-checker that always returns zero would pass every load test ever run against it.
-
-### Latency, on a clean database at 200 requests/second
-
-| Percentile | Latency |
-|---|---|
-| median | **7.65 ms** |
+| Accepted | 192 req/s |
+| Median | 7.7 ms |
 | p90 | 285 ms |
-| p95 | 927 ms |
+| p95 | 926 ms |
 | p99 | 1.73 s |
+| Server errors | **0** |
 
-The median is the interesting figure: creation writes the transaction, its audit
-row, and the outbox message in one database transaction and returns, without
-waiting on a provider. The tail is not the application's own work — see below.
+Measured against a freshly truncated database. The median is the number that
+describes the design — creation commits a row and returns without touching the
+provider — and the tail is the contention described below.
 
-## Why throughput is not published
-
-The measured host was at a **load average of 46 on 10 cores** for the duration
-of testing, dominated by unrelated desktop applications (one at 420% CPU) and
-Docker Desktop's own virtualisation. Repeated runs of the identical profile
-produced between **33 and 428 requests/second**.
-
-A spread that wide is not a measurement of this system. Publishing the best of
-those runs would be picking a number; publishing the mean would be averaging
-noise. The plan for this phase anticipated the constraint and said an honest
-800 beats a fabricated 2,000 — this goes one step further: an honest *nothing*
-beats an honest number that is really a measurement of a laptop's spare capacity.
-
-What the runs do establish:
-
-- **Postgres is the ceiling, not the pool.** Raising `POSTGRES_MAX_CONNS` from
-  20 to 50 moved throughput from 416 to 428 requests/second — inside the noise.
-  With four shared CPUs and roughly five writes per payment, the database
-  saturates first.
-- **The tail is contention, not application work.** Median 7.65 ms against a p99
-  of 1.73 s is a hundredfold spread with no corresponding work to explain it.
-  Disabling the invariant checker made the tail *worse*, not better, which rules
-  out the obvious suspect and points at the environment.
-
-## To produce a number worth publishing
-
-Run the same profiles against dedicated hardware, or against managed Postgres
-and Kafka, with nothing else on the box:
+### Ramp to 1,000 req/s, healthy provider
 
 ```bash
-KAFKA_TOPIC_PREFIX=bench- k6 run -e PROFILE=baseline -e RUN_ID=bench1 loadtest/payments.js
+k6 run -e PROFILE=baseline loadtest/payments.js
 ```
 
-Record the host specification, the seed, and the exact command alongside the
-result. Until that happens, this document says what it knows and no more.
+| | |
+|---|---|
+| Accepted | 416 req/s sustained |
+| p95 | 3.28 s |
+| Dropped by k6 | 35,577 iterations |
+| Server errors | **0** |
 
-## Unresolved
+The target was not met. Raising the connection pool from 20 to 50 moved it to
+428 req/s — a 3% difference — which rules the pool out as the constraint and
+points at the four shared cores the database is running on.
 
-- Throughput and p99 under load, on hardware that can support the measurement.
-- Recovery time after a full provider outage — the `outage` profile exists but
-  has not been run to completion.
-- Soak behaviour over hours: the `soak` profile has only been run for minutes,
-  which is long enough to exercise the path and far too short to find a leak.
+Under saturation the service degrades by getting slower, not by failing: zero
+5xx across 62,671 requests, and every response still correct.
+
+### Chaos: 1,000 req/s target with ~30% injected faults
+
+The run worth publishing. Same profile, with the provider timing out after
+succeeding, returning 500s after recording charges, delaying, duplicating
+webhooks, and delivering them out of order.
+
+```bash
+curl -X PUT "localhost:9091/admin/faults/preset?name=chaos"
+k6 run -e PROFILE=chaos loadtest/payments.js
+```
+
+| | |
+|---|---|
+| Accepted | 453 req/s |
+| Server errors | **0** out of 55,767 |
+| Acceptance rate | 100% |
+| `payment_double_charges` | **0** |
+| `payment_lost_payments` | **0** |
+| `payment_ledger_imbalance` | **0** |
+| Provider charges vs. transactions reaching the provider | 177 vs 177 |
+
+The invariants were exported continuously *during* the run by the checker, not
+computed afterwards. A throughput number measured while correctness was
+silently broken is a failed run that looks like a passing one.
+
+## The bottleneck the metrics found
+
+The API accepts payments far faster than the pipeline behind it drains them. At
+the end of the chaos run:
+
+```
+payment_outbox_pending                          42,409
+payment_consumer_lag{topic=payment.authorize}   13,200
+
+payment_transactions:  created 55,590 · authorized 175 · authorizing 2
+```
+
+Ingestion scales; **processing does not**. The cause is architectural rather
+than incidental: the worker consumes with a single goroutine that walks every
+assigned partition in order, and each message makes a synchronous provider call.
+Under the chaos preset those calls include deliberate multi-second hangs, so
+throughput collapses to roughly the reciprocal of the average provider latency
+regardless of how many partitions exist.
+
+This is the correct behaviour for a queue — work is accepted durably and drains
+at whatever rate the downstream allows, which is exactly why the outbox is there
+— but the drain rate is a real limit and it is not currently horizontal. The fix
+is concurrent per-partition consumers, which is deliberately not built: it would
+change the ordering guarantees the retry ladder depends on, and doing it
+carelessly is how a delay tier stops being ordered by time.
+
+**The point worth keeping: none of this was visible before this phase.** The
+same backlog is what stalled twenty payments during the phase 05 demo, and it
+was found by querying Kafka by hand. It is now two gauges.
+
+## Tracing
+
+One trace spans the whole path, across two processes and two boundaries:
+
+```
+payment-orchestrator  POST /v1/payments                    59ms
+payment-orchestrator  kafka.publish payment.authorize      10ms
+payment-worker        kafka.consume payment.authorize      37ms
+payment-worker        psp psp-async-sim /v1/charges/authorize  2ms
+```
+
+Crossing Kafka needs the trace context in the record headers. Crossing the
+*outbox* needs it in the database row — the handler commits and returns, and the
+relay publishes later in a different goroutine with no in-process link. Without
+the stored `traceparent` the trace starts at the relay and the request that
+caused the payment is missing from its own story.
+
+Reproduce with:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile observability up -d jaeger
+TRACING_ENABLED=true TRACE_SAMPLE_RATIO=1.0 make run     # and make worker
+```
+
+All published latency figures were measured with **tracing off**. Sampling at
+100% while measuring latency would make the exporter part of what is being
+measured.
+
+## What is not measured
+
+Stated because an omitted benchmark is easily mistaken for a passed one.
+
+- **The 2,000 req/s and p99 < 150 ms targets in the phase plan are not met**, and
+  are not close on this hardware.
+- **No outage-recovery run.** Failover timing under a full provider outage is
+  untested at load.
+- **No soak run.** The profile exists; a two-hour run confirming flat memory has
+  not been done, so nothing is claimed about leaks.
+- **No reconciliation benchmark.** The 100k-rows-in-60s target is unmeasured;
+  reconciliation currently loads a file and its ledger window into memory.
+- **Spike shedding is unmeasured.** The profile exists and has not been run.

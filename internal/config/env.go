@@ -84,6 +84,24 @@ func (l *loader) bool(key string, def bool) bool {
 	return v
 }
 
+// float reads a floating-point value, used for sampling ratios.
+func (l *loader) float(key string, def float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		l.fail(key, fmt.Sprintf("must be a number, got %q", raw))
+		return def
+	}
+	if v < 0 || v > 1 {
+		l.fail(key, fmt.Sprintf("must be between 0 and 1, got %v", v))
+		return def
+	}
+	return v
+}
+
 // csv reads a comma-separated list, trimming whitespace around each element.
 func (l *loader) csv(key string, def []string) []string {
 	raw := strings.TrimSpace(os.Getenv(key))

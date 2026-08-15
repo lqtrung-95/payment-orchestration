@@ -55,6 +55,9 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 
 	chain := []app.HandlerFunc{
 		middleware.RequestID(),
+		// Before Recovery, so a panicking handler still produces a span that
+		// records the error rather than vanishing from the trace entirely.
+		middleware.Tracing(),
 		middleware.Recovery(deps.Logger),
 		middleware.Logging(deps.Logger),
 	}
