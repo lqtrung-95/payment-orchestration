@@ -2,7 +2,6 @@ package fx
 
 import (
 	"fmt"
-	"math"
 	"math/big"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/domain/money"
@@ -41,7 +40,7 @@ func (r Rate) Convert(amount money.Money) (money.Money, error) {
 		den.Mul(den, pow10(-shift))
 	}
 
-	converted, err := divRoundHalfEven(num, den)
+	converted, err := money.DivRoundHalfEven(num, den)
 	if err != nil {
 		return money.Money{}, err
 	}
@@ -51,53 +50,4 @@ func (r Rate) Convert(amount money.Money) (money.Money, error) {
 // pow10 returns 10^n as a big integer, for n >= 0.
 func pow10(n int) *big.Int {
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
-}
-
-// divRoundHalfEven divides num by den using banker's rounding.
-//
-// Half-even rather than half-up because FX conversion is applied to a very large
-// number of amounts, and half-up is biased: it rounds up on every exact tie, so
-// the error accumulates in one direction and shows up as a systematic drift
-// against a settlement file. Half-even splits ties between up and down, so the
-// bias cancels. It is the rounding mode financial systems converge on for
-// exactly this reason.
-func divRoundHalfEven(num, den *big.Int) (int64, error) {
-	if den.Sign() == 0 {
-		return 0, fmt.Errorf("%w: division by zero", ErrInvalidRate)
-	}
-
-	// Sign is handled separately so the tie comparison below reasons about
-	// magnitudes only, rather than about Go's truncation-toward-zero.
-	negative := num.Sign()*den.Sign() < 0
-	absNum := new(big.Int).Abs(num)
-	absDen := new(big.Int).Abs(den)
-
-	quo, rem := new(big.Int).QuoRem(absNum, absDen, new(big.Int))
-
-	// Compare 2×remainder against the divisor to place the tie.
-	twice := new(big.Int).Lsh(rem, 1)
-	switch twice.Cmp(absDen) {
-	case 1:
-		quo.Add(quo, big.NewInt(1))
-	case 0:
-		// Exactly half: round to the even neighbour.
-		if quo.Bit(0) == 1 {
-			quo.Add(quo, big.NewInt(1))
-		}
-	}
-
-	if negative {
-		quo.Neg(quo)
-	}
-	if !quo.IsInt64() {
-		return 0, fmt.Errorf("%w: result %s", ErrRateOverflow, quo)
-	}
-
-	result := quo.Int64()
-	if result == math.MinInt64 {
-		// Negating MinInt64 is not representable, so downstream arithmetic on it
-		// would silently wrap.
-		return 0, fmt.Errorf("%w: result is int64 minimum", ErrRateOverflow)
-	}
-	return result, nil
 }

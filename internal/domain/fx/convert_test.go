@@ -148,8 +148,8 @@ func TestConvertRejectsAMismatchedCurrency(t *testing.T) {
 func TestConvertDetectsOverflow(t *testing.T) {
 	huge := rate(t, "USD", "VND", 25_400_000_000_000)
 	_, err := huge.Convert(money.MustNew(1<<62, "USD"))
-	if !errors.Is(err, fx.ErrRateOverflow) {
-		t.Errorf("Convert of an enormous amount = %v, want ErrRateOverflow", err)
+	if !errors.Is(err, money.ErrRoundingOverflow) {
+		t.Errorf("Convert of an enormous amount = %v, want ErrRoundingOverflow", err)
 	}
 }
 

@@ -73,6 +73,13 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 	)
 	v1.GET("/payments/:id", payments.Get)
 
+	// Capture carries an idempotency key for the same reason creation does: it
+	// moves money, and a retried request must not take the funds twice.
+	v1.POST("/payments/:id/capture",
+		middleware.Idempotency(deps.DB, deps.IdempotencyRepo, deps.Logger),
+		payments.Capture,
+	)
+
 	// Outside /v1 and outside the idempotency middleware. Providers do not send
 	// an Idempotency-Key, and webhook deduplication is by the provider's own
 	// event id against a unique index — a different mechanism for a different

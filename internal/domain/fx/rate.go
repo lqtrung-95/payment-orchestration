@@ -28,7 +28,6 @@ var (
 	ErrInvalidRate      = errors.New("fx rate must be positive")
 	ErrSamePair         = errors.New("fx rate base and quote must differ")
 	ErrCurrencyMismatch = errors.New("amount currency does not match the rate base")
-	ErrRateOverflow     = errors.New("fx conversion overflows int64")
 )
 
 // Rate is "one major unit of Base buys Nano/Scale major units of Quote".
@@ -83,7 +82,7 @@ func (r Rate) Invert() (Rate, error) {
 
 	// (Scale * Scale) / Nano, rounded half to even.
 	num := new(big.Int).Mul(big.NewInt(Scale), big.NewInt(Scale))
-	inverted, err := divRoundHalfEven(num, big.NewInt(r.Nano))
+	inverted, err := money.DivRoundHalfEven(num, big.NewInt(r.Nano))
 	if err != nil {
 		return Rate{}, err
 	}

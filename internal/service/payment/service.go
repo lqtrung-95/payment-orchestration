@@ -25,18 +25,22 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
+	feestore "github.com/lequoctrung/payment-orchestrator/internal/store/fee"
+	ledgerstore "github.com/lequoctrung/payment-orchestrator/internal/store/ledger"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
 )
 
 var ErrNotFound = errors.New("payment not found")
 
 type Service struct {
-	db        *postgres.DB
-	txRepo    *txstore.Repository
-	providers *psp.Registry
-	outbox    *outbox.Writer
-	topics    messaging.Topics
-	logger    *slog.Logger
+	db         *postgres.DB
+	txRepo     *txstore.Repository
+	ledgerRepo *ledgerstore.Repository
+	feeRepo    *feestore.Repository
+	providers  *psp.Registry
+	outbox     *outbox.Writer
+	topics     messaging.Topics
+	logger     *slog.Logger
 }
 
 func NewService(
@@ -48,8 +52,11 @@ func NewService(
 	logger *slog.Logger,
 ) *Service {
 	return &Service{
-		db: db, txRepo: txRepo, providers: providers,
-		outbox: outboxWriter, topics: topics, logger: logger,
+		db: db, txRepo: txRepo,
+		ledgerRepo: ledgerstore.NewRepository(),
+		feeRepo:    feestore.NewRepository(),
+		providers:  providers,
+		outbox:     outboxWriter, topics: topics, logger: logger,
 	}
 }
 
