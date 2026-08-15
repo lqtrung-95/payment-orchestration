@@ -61,6 +61,7 @@ build: ## Build binaries into bin/
 	go build -o $(BIN_DIR)/pspsim ./cmd/pspsim
 	go build -o $(BIN_DIR)/dlqctl ./cmd/dlqctl
 	go build -o $(BIN_DIR)/webhookctl ./cmd/webhookctl
+	go build -o $(BIN_DIR)/reconctl ./cmd/reconctl
 
 .PHONY: run
 run: ## Run the orchestrator against the local stack
@@ -89,6 +90,10 @@ pspsim: ## Run the fault-injecting provider simulator (separate process)
 .PHONY: replay
 replay: ## Re-evaluate the stored webhook log against current state (writes nothing)
 	go run ./cmd/webhookctl replay -v
+
+.PHONY: breaks
+breaks: ## List open reconciliation breaks
+	go run ./cmd/reconctl breaks -status open
 
 .PHONY: charges
 charges: ## Show what the simulated provider believes it charged

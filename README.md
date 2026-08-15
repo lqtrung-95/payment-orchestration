@@ -10,12 +10,14 @@ times, out of order, before the API call that created the transaction returned.
 A settlement file that disagrees with your ledger by three cents. The happy path
 is a CRUD app; the failure paths are the actual problem.
 
-> **Status: in progress — 5 of 10 phases complete.**
+> **Status: in progress — 6 of 10 phases complete.**
 > Built and tested: ledger, state machine, idempotency, provider abstraction, a
 > provider simulator that fails on purpose, an asynchronous pipeline —
 > transactional outbox, Kafka, error-aware retries, DLQ — and webhook ingestion
-> with deduplication and out-of-order tolerance.
-> Reconciliation, FX, and sharding are not built yet.
+> with deduplication and out-of-order tolerance, capture posting to a
+> double-entry ledger, and settlement reconciliation with an eight-category
+> break taxonomy.
+> Sharding, observability, and load testing are not built yet.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -48,6 +50,8 @@ the four places that write this table."
 | A payment is never failed on an unknown outcome | `GetStatus` recovery; unresolved stays non-terminal | No |
 | Queued work is never lost or invented | Outbox row written in the domain transaction | No |
 | A declined payment is never retried | Retry policy keyed on the error class | No |
+| A capture never exceeds its authorisation | Checked before the provider call, by the aggregate, and by a `CHECK` | No |
+| A break can't be closed anonymously | `CHECK` requiring actor, reason, and timestamp | No |
 | A webhook is processed once | `UNIQUE (provider, provider_event_id)` | No |
 | A stale webhook can't move a transaction backwards | `last_applied_event_seq` high-water mark, under a row lock | No |
 | A webhook can't invent a payment | Correlation only; no insert path from ingestion | No |
@@ -167,6 +171,52 @@ over those exact bytes, and normalising them means the stored event can never be
 verified again. `webhookctl replay` re-reads the log and reports what would
 change; a healthy log changes nothing.
 
+### Settlement reconciliation
+
+A provider's file and our ledger disagree constantly, and *"the totals don't
+match"* is not a finding — it is the absence of one. An operator needs to know
+whether to chase the provider, fix an ingestion gap, wait for the next file, or
+write the difference off. Those are four responses, so there are eight
+categories:
+
+| Category | Meaning | Auto-resolvable |
+|---|---|---|
+| `duplicate_settlement` | The provider settled one charge twice | No |
+| `currency_mismatch` | Currencies disagree outright | No |
+| `fx_drift` | Difference explained by the rate moving | **Yes** |
+| `fee_mismatch` | Net differs by the fee — schedule drift | No |
+| `amount_mismatch` | Amounts differ, nothing explains it | No |
+| `timing_cutoff` | Settles in the adjacent window, not missing | **Yes** |
+| `missing_internally` | Settled at the provider, absent from our books | No |
+| `missing_at_psp` | Captured by us, absent from the file | No |
+
+**The order is load-bearing.** A duplicate settlement also presents as an amount
+mismatch; so does FX drift. Testing the specific explanations before the general
+one is what stops every break landing in the vaguest bucket that fits —
+reordering the classifier silently degrades it into a single "amounts differ"
+category.
+
+`fx_drift` is decided by reproducing the provider's own arithmetic, not by size:
+*does applying the rate it says it used produce the figure it sent?* A
+difference of the right size for the wrong reason is still unexplained, and
+treating size alone as the criterion is how a real error gets closed as drift.
+Only the two *explained* categories may auto-resolve.
+
+Reconciliation reads the **ledger**, not `payment_transactions.captured_minor`.
+The column says what the service intended to record; the postings say what was
+actually accounted for. Comparing against the column would compare the provider
+to our own intent and quietly agree with itself.
+
+Matching is exact on the provider reference. A fuzzy fallback on amount and date
+is deliberately absent: pairing two records because they share an amount and a
+day produces a confident wrong answer, and nobody ever re-examines a confident
+one.
+
+Re-running is safe — breaks carry a natural identity, so a repeat run recognises
+the same disagreement rather than raising it again, and any decision recorded
+against it survives. Closing a break demands an actor and a reason, enforced by a
+`CHECK` as well as in Go.
+
 ### The provider misbehaves on purpose
 
 `cmd/pspsim` is a separate process implementing a deliberately unreliable
@@ -195,7 +245,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 135 tests, green in
+Measured on this repo, not projected. 158 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -253,6 +303,26 @@ publisher re-sent the same batch. Claiming by lease fixed it.
 
 **A rolled-back payment leaves no queued work**, and a committed one leaves
 exactly one message — the property the outbox exists for.
+
+**Reconciliation** — a generated settlement file with one deliberate defect of
+each kind, plus a clean payment that must not produce a break:
+
+```
+all 8 categories detected and correctly classified
+clean payment reconciles silently — no manufactured breaks
+fx_drift distinguished from amount_mismatch at the same delta
+re-running the same file       0 new breaks
+re-ingesting identical bytes   recognised, not duplicated
+```
+
+**Capture posts a balanced entry** — debits equal credits, and payable plus fee
+equals clearing, so no minor unit is created or destroyed. A capture that
+exceeds its authorisation never reaches the provider at all; the test asserts
+the provider's charge count, because asserting only "an error was returned"
+passes whether or not the customer was charged.
+
+**Rounding is unbiased** — zero drift across a thousand exact ties, which
+half-up fails.
 
 **Webhooks under chaos** — 30 payments against the asynchronous provider with
 every webhook fault live, so the outcome could only ever arrive by callback:
@@ -421,7 +491,7 @@ One service with enforced module boundaries, deliberately not microservices — 
 distributed monolith would be a worse design, not a better one, at this size.
 
 ```
-cmd/          orchestrator, worker, migrate, pspsim, dlqctl, webhookctl
+cmd/          orchestrator, worker, migrate, pspsim, dlqctl, webhookctl, reconctl
 internal/
   domain/     money, ledger, transaction   — no I/O, no framework types
   store/      repositories                  — take a Querier, so callers own the tx boundary
@@ -429,6 +499,8 @@ internal/
   simulator/  the provider that fails on purpose
   outbox/     transactional outbox writer and relay
   messaging/  Kafka topics, producer, consumer group with partition-level deferral
+  fx/         fixed-point rates, locks, conversion  (domain/fx)
+  recon/      settlement parsing, matching, the break taxonomy, resolution
   webhook/    ingest, per-provider verifiers, guarded processor, replay
   worker/     queue handlers, router, dedup
   resilience/ backoff with full jitter, circuit breaker
@@ -455,6 +527,7 @@ the alternatives that were seriously considered and rejected.
 - [0006 — Ambiguous provider outcomes are resolved, not guessed](docs/adr/0006-ambiguous-provider-outcomes-are-resolved-not-guessed.md)
 - [0007 — Transactional outbox and error-aware retries](docs/adr/0007-transactional-outbox-and-error-aware-retries.md)
 - [0008 — Webhook ingestion, deduplication, and ordering](docs/adr/0008-webhook-ingestion-and-ordering.md)
+- [0009 — FX, capture postings, and settlement reconciliation](docs/adr/0009-fx-capture-postings-and-reconciliation.md)
 
 ## Known gaps
 
@@ -464,8 +537,13 @@ Stated plainly, because a README that omits them is not worth reading.
   caller can claim to be any merchant. The tenant isolation is only as real as
   that header. Must be replaced before this is exposed anywhere.
 - **No reaper for expired idempotency records**, so that table grows unbounded.
-- **Capture and refund have no HTTP surface.** Both exist on the aggregate and
-  are tested, but need a provider to be meaningful.
+- **Refund has no HTTP surface.** It exists on the aggregate and is tested, but
+  is not exposed and refund settlement rows are not classified.
+- **FX gain/loss is detected but not posted.** Drift is classified and reported;
+  no adjustment entry is written, so rate movement is visible rather than
+  accounted. The largest remaining gap in reconciliation.
+- **Reconciliation is unbenchmarked.** It loads a file and its ledger window
+  into memory, which suits demo scale; the 100k-row target is unmeasured.
 - **Sharding is decided, not implemented.** The key is derived and stored on
   every row; routing across physical databases comes later. Storing it now is
   the point — backfilling a shard key across a populated ledger means rewriting
@@ -497,9 +575,9 @@ Stated plainly, because a README that omits them is not worth reading.
 | 03 | PSP abstraction + deliberately misbehaving simulator | Done |
 | 04 | Transactional outbox → Kafka → retry ladder → DLQ | Done |
 | 05 | Webhook ingest, dedup, out-of-order tolerance | Done |
-| 06 | Payment instrument binding + lifecycle | Next |
-| 07 | FX conversion + settlement reconciliation | |
-| 08 | Sharding + cross-shard transactions (TCC) | |
+| 06 | Payment instrument binding + lifecycle | Skipped |
+| 07 | FX conversion + settlement reconciliation | Done |
+| 08 | Sharding + cross-shard transactions (TCC) | Next |
 | 09 | OpenTelemetry, load + chaos testing | |
 | 10 | Architecture docs and demo | |
 

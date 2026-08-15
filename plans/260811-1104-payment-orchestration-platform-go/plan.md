@@ -27,8 +27,8 @@ CloudWeGo is ByteDance's own open-source Go stack — using it is a deliberate s
 | 03 | [PSP abstraction + chaos simulator](phase-03-psp-abstraction-and-chaos-simulator.md) | 5 | **Complete** |
 | 04 | [Outbox, Kafka, retry, DLQ](phase-04-outbox-kafka-retry-dlq.md) | 6–7 | **Complete** |
 | 05 | [Webhook ingestion + dedup](phase-05-webhook-ingestion-and-dedup.md) | 8 | **Complete** |
-| 06 | [Payment instrument lifecycle](phase-06-payment-instrument-lifecycle.md) | 9 | Not started |
-| 07 | [FX + reconciliation](phase-07-fx-and-reconciliation.md) | 10 | Not started |
+| 06 | [Payment instrument lifecycle](phase-06-payment-instrument-lifecycle.md) | 9 | Skipped — not a dependency for 07 |
+| 07 | [FX + reconciliation](phase-07-fx-and-reconciliation.md) | 10 | **Complete** |
 | 08 | [Sharding + distributed transactions](phase-08-sharding-and-distributed-transactions.md) | 11 | Not started |
 | 09 | [Observability + load/chaos testing](phase-09-observability-and-load-chaos-testing.md) | 12 | Not started |
 | 10 | [Docs, ADRs, demo, resume assets](phase-10-docs-adrs-demo-and-resume-assets.md) | 12 | Not started |

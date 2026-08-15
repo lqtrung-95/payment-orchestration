@@ -168,8 +168,19 @@ func TestFailedPublishBacksOffAndRetains(t *testing.T) {
 	db := testsupport.FreshDB(t)
 	writer := outbox.NewWriter()
 	broker := &recordingBroker{failNext: 1}
-	publisher := newPublisher(db, broker)
 	ctx := context.Background()
+
+	// A long, jitter-free backoff. The default draws full jitter from a window
+	// that starts at the 50ms floor, so "an immediate re-sweep finds nothing"
+	// is only reliable if the re-sweep beats a delay that can be very short —
+	// which a loaded machine does not guarantee. What is under test is that the
+	// row is deferred at all, not how long for.
+	cfg := outbox.DefaultPublisherConfig()
+	cfg.BatchSize = 50
+	cfg.MaxAttempts = 3
+	cfg.RetryFloor = time.Minute
+	cfg.Backoff.Base, cfg.Backoff.Max = time.Minute, time.Minute
+	publisher := outbox.NewPublisher(db, broker, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if err := db.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		_, err := writer.Enqueue(ctx, tx, outbox.Message{
@@ -205,7 +216,7 @@ func TestFailedPublishBacksOffAndRetains(t *testing.T) {
 		t.Error("last_error not recorded; the failure would be undiagnosable")
 	}
 
-	// Backed off, so an immediate sweep finds nothing due.
+	// Backed off by a minute, so a re-sweep now finds nothing due.
 	if n, err := publisher.Sweep(ctx); err != nil || n != 0 {
 		t.Errorf("immediate re-sweep published %d (err %v), want 0 — the row should be backed off", n, err)
 	}

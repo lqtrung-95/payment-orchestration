@@ -36,13 +36,19 @@ func NewDB(t *testing.T) *postgres.DB {
 	defer cancel()
 
 	db, err := postgres.New(ctx, config.Postgres{
-		DSN:               dsn,
-		MaxConns:          25,
-		MinConns:          2,
-		MaxConnLifetime:   time.Hour,
-		MaxConnIdleTime:   30 * time.Minute,
-		ConnectTimeout:    5 * time.Second,
-		StatementTimeout:  10 * time.Second,
+		DSN:             dsn,
+		MaxConns:        25,
+		MinConns:        2,
+		MaxConnLifetime: time.Hour,
+		MaxConnIdleTime: 30 * time.Minute,
+		ConnectTimeout:  5 * time.Second,
+		// Well above the production setting. The suite's slowest statement is
+		// the TRUNCATE between cases, which takes an ACCESS EXCLUSIVE lock on
+		// every table and is dominated by filesystem work rather than by rows —
+		// all of these tables are empty when it runs. On a loaded container
+		// runtime that can stall for tens of seconds, and failing there teaches
+		// people to rerun the suite instead of reading it.
+		StatementTimeout:  60 * time.Second,
 		HealthCheckPeriod: 30 * time.Second,
 	})
 	if err != nil {
@@ -70,6 +76,11 @@ func Truncate(t *testing.T, db *postgres.DB) {
 
 	const query = `
 		TRUNCATE
+			recon_breaks,
+			recon_runs,
+			settlement_rows,
+			settlement_files,
+			fx_rate_locks,
 			webhook_events_raw,
 			transaction_state_changes,
 			postings,
@@ -81,7 +92,11 @@ func Truncate(t *testing.T, db *postgres.DB) {
 			ledger_accounts
 		RESTART IDENTITY CASCADE`
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Generous, because this is fixture setup rather than behaviour under test.
+	// TRUNCATE takes an ACCESS EXCLUSIVE lock on every table listed, and the
+	// list grows with each phase; a tight deadline turns a loaded machine into
+	// a failing test suite, which teaches people to rerun rather than to look.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if _, err := db.Pool().Exec(ctx, query); err != nil {

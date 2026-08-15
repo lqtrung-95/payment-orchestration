@@ -1,6 +1,6 @@
 # Phase 07 — FX Conversion + Settlement Reconciliation
 
-**Priority:** P1 — the moat · **Status:** Not started · **Week:** 10
+**Priority:** P1 — the moat · **Status:** Complete · **Week:** 10 · **Verified on 2026-08-15**
 
 Reconciliation is the rarest item on the entire feature list. Thousands of candidates have "integrated Stripe." Almost none have diffed a settlement file against an internal ledger and classified the breaks. ByteDance names *reconciliations* and *foreign exchange conversion* directly in their team description.
 
@@ -82,17 +82,17 @@ Eight categories. `fx_drift` and `timing_cutoff` are the ones that signal you ha
 
 ## Todo
 
-- [ ] Multi-currency ledger accounts
-- [ ] FX rate provider + historical storage
-- [ ] Rate lock with TTL
-- [ ] FX gain/loss posting
-- [ ] Per-provider settlement parsers
-- [ ] Matching engine (exact → fuzzy)
-- [ ] Eight-category classifier
-- [ ] Break resolution workflow + adjustments
-- [ ] Seeded settlement generator
-- [ ] `reconctl` + summary report
-- [ ] Auto-resolve rules
+- [x] Multi-currency ledger accounts — created on demand, per currency
+- [x] FX rate provider + historical storage
+- [x] Rate lock with TTL, append-only, expiry enforced inside Convert
+- [ ] FX gain/loss posting — **not built**, see Deferred
+- [x] Per-provider settlement parsers
+- [x] Matching engine — exact only; fuzzy deliberately not built, see Deviations
+- [x] Eight-category classifier
+- [x] Break resolution workflow — adjustments modelled, not written
+- [x] Seeded settlement generator
+- [x] `reconctl` + summary report with exposure
+- [x] Auto-resolve rules — `fx_drift` and `timing_cutoff` only
 
 ## Success criteria
 
@@ -114,6 +114,64 @@ Eight categories. `fx_drift` and `timing_cutoff` are the ones that signal you ha
 - Settlement files contain financial data — encrypt at rest, restrict access, log every read.
 - Adjustment entries are money movement: require actor attribution and reason on every one.
 - Auto-resolve tolerance is a config value with an audit trail; changing it is a privileged operation.
+
+## Verified on 2026-08-15
+
+- **All eight categories detected and correctly classified** from a generated
+  file with one defect of each kind planted deliberately, asserted by count. A
+  clean payment in the same file reconciles silently, so the test also proves
+  the classifier does not manufacture breaks.
+- **FX drift is distinguished from an unexplained mismatch**: the same size of
+  difference lands in `fx_drift` when the provider's stated rate reproduces its
+  figure, and would land in `amount_mismatch` otherwise.
+- **Re-running a reconciliation raises zero new breaks**, and re-ingesting
+  identical bytes under a different filename recognises the original file.
+- **Capture posts a balanced three-legged entry**; debits equal credits, and
+  payable plus fee equals clearing, so no minor unit is created or destroyed.
+- **Rounding is unbiased** across a thousand exact ties, which half-up fails.
+- Full suite green under `-race`, lint clean.
+
+## Bugs found
+
+**Capture charged the customer before validating.** The amount was checked after
+the provider call, so capturing 80.00 against a 50.00 authorisation took the
+funds and then refused to record them — money gone, ledger empty. Found by
+probing the provider's charge count; the obvious assertions (an error is
+returned, the ledger is empty) pass in both the broken and fixed versions.
+Validation now runs before the request reaches the provider.
+
+**The ledger had never been written to.** `RecordEntry` was called only by its
+own tests. This phase's premise — diffing settlement against the ledger — was
+unimplementable until capture existed, which the plan did not account for.
+
+## Deviations from the plan
+
+- **Fuzzy matching not built.** Pairing records that merely share an amount and
+  a date produces a confident wrong answer, which is worse than an unmatched
+  pair a human reviews. The plan's risk table already said never to auto-resolve
+  a fuzzy match; declining to make the match at all is the same argument
+  followed through.
+- **Capture and fee schedules added.** Not in this phase's scope, but the phase
+  is meaningless without them.
+- **`timing_cutoff` is decided by capture time, not by the row.** A payment
+  outside the file's window is absent from it by definition; a late row would
+  simply match and agree.
+
+## Deferred
+
+- **FX gain/loss posting is not written.** The account purpose exists and the
+  drift is detected and reported, but no adjustment entry is raised, so rate
+  movement is visible rather than accounted. This is the largest remaining gap
+  in the phase and the honest limit on the "keeps a cross-currency ledger
+  balanced" claim.
+- **Adjustment entries generally.** `recon_breaks.adjustment_entry_id` is
+  modelled and never populated: resolving a break records a decision without
+  moving money.
+- **100k rows in under 60s is unmeasured.** Reconciliation loads a file and its
+  ledger window into memory, which suits demo scale and is the first thing to
+  revisit under load.
+- **Refund has no HTTP surface**, and refund settlement rows are not classified.
+- **Settlement files are unencrypted** and retained indefinitely.
 
 ## Next steps
 
