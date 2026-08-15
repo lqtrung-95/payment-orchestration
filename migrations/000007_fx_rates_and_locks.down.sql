@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS fx_rate_locks;
+DROP TABLE IF EXISTS fx_rates;

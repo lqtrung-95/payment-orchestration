@@ -29,8 +29,16 @@ func (c Currency) String() string { return string(c) }
 //
 // Getting this wrong is a display bug with real consequences: rendering a
 // 50,000 VND charge as "500.00" understates it by two orders of magnitude.
-// Arithmetic never consults this table — minor units are minor units — so an
-// unlisted currency is safe, merely formatted with the two-decimal default.
+//
+// Arithmetic *within* a currency never consults this table — minor units are
+// minor units, and adding two USD amounts does not care how they are printed.
+// Arithmetic *between* currencies does: converting 100.00 USD to JPY has to
+// account for two decimal places becoming none, and a conversion that skips it
+// is wrong by a factor of a hundred. See fx.Rate.Convert, which is the only
+// place that difference is applied.
+//
+// An unlisted currency is therefore safe for storage and same-currency maths,
+// and is treated as two-decimal everywhere else.
 var exponents = map[Currency]int{
 	"BHD": 3, // Bahraini dinar
 	"CLP": 0, // Chilean peso
