@@ -4,9 +4,11 @@ package http
 import (
 	"log/slog"
 
+	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/service/payment"
 	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
@@ -26,6 +28,7 @@ type Deps struct {
 	PaymentService  *payment.Service
 	IdempotencyRepo *idempotency.Repository
 	WebhookIngestor *webhook.Ingestor
+	Metrics         *metrics.Metrics
 }
 
 // New builds the HTTP server. Ordering of the middleware chain is deliberate:
@@ -50,16 +53,29 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 		server.WithMaxRequestBodySize(cfg.HTTP.MaxBodyBytes),
 	)
 
-	h.Use(
+	chain := []app.HandlerFunc{
 		middleware.RequestID(),
 		middleware.Recovery(deps.Logger),
 		middleware.Logging(deps.Logger),
-		middleware.Timeout(cfg.HTTP.RequestTimeout),
-	)
+	}
+	if deps.Metrics != nil {
+		// Outside the timeout so a request that times out is still counted —
+		// the requests you most want measured are the ones that failed.
+		chain = append(chain, middleware.Metrics(deps.Metrics))
+	}
+	chain = append(chain, middleware.Timeout(cfg.HTTP.RequestTimeout))
+	h.Use(chain...)
 
 	health := handler.NewHealth(deps.Health...)
 	h.GET("/healthz", health.Live)
 	h.GET("/readyz", health.Ready)
+
+	// Scrape endpoint. Deliberately on the same listener for local simplicity;
+	// a deployed environment binds it to an internal interface, because the
+	// metric names alone describe the system's shape to anyone who reads them.
+	if deps.Metrics != nil {
+		h.GET("/metrics", handler.Prometheus(deps.Metrics))
+	}
 
 	payments := handler.NewPayment(deps.PaymentService, deps.Logger)
 	v1 := h.Group("/v1")

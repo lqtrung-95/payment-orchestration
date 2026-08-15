@@ -99,6 +99,28 @@ breaks: ## List open reconciliation breaks
 charges: ## Show what the simulated provider believes it charged
 	@curl -s $(PSPSIM_URL)/admin/charges | jq '{count, charges: [.charges[] | {reference, status, amount_minor}]}'
 
+# --- Load testing ----------------------------------------------------------
+
+RUN_ID ?= $(shell date +%s)
+
+.PHONY: load-smoke
+load-smoke: ## Correctness-only load run (10 rps, 30s)
+	k6 run -e PROFILE=smoke -e RUN_ID=$(RUN_ID) loadtest/payments.js
+
+.PHONY: load-baseline
+load-baseline: ## Ramping load run against a healthy provider
+	k6 run -e PROFILE=baseline -e RUN_ID=$(RUN_ID) loadtest/payments.js
+
+.PHONY: load-chaos
+load-chaos: ## Ramping load run with the full fault catalogue live
+	@curl -s -X PUT "$(PSPSIM_URL)/admin/faults/preset?name=chaos" >/dev/null
+	k6 run -e PROFILE=chaos -e RUN_ID=$(RUN_ID) loadtest/payments.js
+
+.PHONY: invariants
+invariants: ## Show the three must-be-zero counters
+	@curl -s http://localhost:8080/metrics \
+		| grep -E '^payment_(double_charges|lost_payments|ledger_imbalance) '
+
 # --- Demo ------------------------------------------------------------------
 
 .PHONY: demo

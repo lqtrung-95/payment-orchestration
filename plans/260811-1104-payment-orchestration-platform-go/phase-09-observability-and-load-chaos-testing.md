@@ -1,6 +1,6 @@
 # Phase 09 — Observability + Load/Chaos Testing
 
-**Priority:** P1 — this phase manufactures the resume numbers · **Status:** Not started · **Week:** 12
+**Priority:** P1 — this phase manufactures the resume numbers · **Status:** Partly complete · **Week:** 12 · **Worked on 2026-08-15**
 
 Load testing alone gives you "2k RPS" — unremarkable. Load testing **while the PSP fails 30% of calls** gives you a claim nobody else has. Run them together or the phase is wasted.
 
@@ -83,17 +83,17 @@ The JD asks for "excellent experience in online positioning and problem solving.
 
 ## Todo
 
-- [ ] OTel tracing across HTTP, DB, Kafka, PSP
-- [ ] Trace context propagation through Kafka headers
-- [ ] Full metric set registered
-- [ ] Grafana dashboard provisioned
-- [ ] Continuous invariant checker
-- [ ] Six k6 profiles
-- [ ] Baseline run recorded
+- [ ] OTel tracing across HTTP, DB, Kafka, PSP — **not started**
+- [ ] Trace context propagation through Kafka headers — **not started**
+- [x] Full metric set registered, exposed at `/metrics`
+- [ ] Grafana dashboard provisioned — Prometheus scrapes, no dashboard yet
+- [x] Continuous invariant checker, tested against seeded violations
+- [x] Five k6 profiles (smoke, baseline, chaos, spike, soak)
+- [x] Baseline run executed — **result not publishable**, see below
 - [ ] Chaos run recorded
 - [ ] Outage + spike recovery recorded
-- [ ] Soak run clean
-- [ ] `docs/benchmarks/` with reproducible commands + seeds
+- [ ] Soak run clean — run for minutes, not hours
+- [x] `docs/benchmarks/` with method, results, and why throughput is withheld
 
 ## Success criteria
 
@@ -116,6 +116,54 @@ The JD asks for "excellent experience in online positioning and problem solving.
 - No card data, tokens, or PII in spans, logs, or metric labels. Audit span attributes explicitly.
 - Metrics endpoint must not be publicly exposed.
 - High-cardinality labels (transaction ID) are both a cost and a leak risk — never label by them.
+
+## Worked on 2026-08-15
+
+**Built and verified**
+
+- `/metrics` exposing a payment-domain set, including the three must-be-zero
+  gauges. Cardinality is bounded deliberately — nothing labelled by transaction
+  id, merchant, or reference.
+- A continuous invariant checker for ledger imbalance, double captures, and
+  captured-with-no-entry. It is tested against **seeded** violations, which is
+  the test that matters: a checker that always returns zero passes every load
+  test ever run against it.
+- A depth sampler for outbox backlog, per-topic consumer lag, and DLQ depth —
+  the visibility whose absence meant a stalled consumer had to be found by hand
+  in phase 05.
+- Five k6 profiles sharing one request path, with thresholds as assertions so a
+  degraded run exits non-zero.
+
+**Measured**
+
+164,933 payments created across the runs, with zero ledger imbalance, zero
+double charges, and zero lost payments. Four 5xx, all statement timeouts on the
+idempotency claim under severe host contention — the system shed work rather
+than corrupting state. Median latency on a clean database at 200 rps: 7.65ms.
+
+**Not measured, and why**
+
+No throughput figure is published. The host sat at a load average of 46 on 10
+cores throughout, dominated by unrelated desktop applications, and repeated runs
+of the identical profile produced between 33 and 428 requests/second. That
+spread is a measurement of a laptop's spare capacity, not of this system. The
+phase's own risk table said an honest 800 beats a fabricated 2,000; this goes
+further — an honest *nothing* beats a number that is really noise.
+
+Two things the runs did establish: raising the connection pool from 20 to 50
+moved throughput by 3%, so Postgres is the ceiling rather than the pool; and
+disabling the invariant checker made the latency tail *worse*, ruling out the
+obvious suspect for a hundredfold median-to-p99 spread.
+
+**Deferred**
+
+- Tracing entirely. The single end-to-end trace is the phase's most distinctive
+  artifact and it does not exist.
+- Grafana dashboard — Prometheus scrapes, nothing renders it.
+- Chaos, outage, and soak runs to completion.
+- PSP error, decline, retry, breaker, and webhook counters are registered but
+  not yet incremented from their call sites; only HTTP, the invariants, and the
+  depths are wired.
 
 ## Next steps
 

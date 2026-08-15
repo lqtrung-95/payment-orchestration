@@ -20,6 +20,20 @@ type Config struct {
 	Log      Log
 	PSP      PSP
 	Webhook  Webhook
+
+	Observability Observability
+}
+
+// Observability configures self-reporting.
+type Observability struct {
+	// CheckInterval is how often the invariant checker and depth sampler run.
+	// Frequent enough that a violation during a load test is visible while the
+	// run is happening, cheap enough to leave on permanently.
+	CheckInterval time.Duration
+
+	// ConsumerGroup names the group whose lag is reported. It has to match the
+	// worker's, or the lag gauge reports on a group nobody is consuming with.
+	ConsumerGroup string
 }
 
 // Webhook configures the provider-facing ingestion endpoint.
@@ -181,6 +195,11 @@ func Load() (*Config, error) {
 		Webhook: Webhook{
 			Provider: l.str("WEBHOOK_PROVIDER", "psp-sim"),
 			Secret:   l.str("WEBHOOK_SECRET", devWebhookSecret),
+		},
+
+		Observability: Observability{
+			CheckInterval: l.duration("OBSERVABILITY_CHECK_INTERVAL", 5*time.Second),
+			ConsumerGroup: l.str("KAFKA_CONSUMER_GROUP", "payment-workers"),
 		},
 	}
 

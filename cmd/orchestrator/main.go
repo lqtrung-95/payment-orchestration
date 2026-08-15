@@ -14,9 +14,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
+	"github.com/lequoctrung/payment-orchestrator/internal/invariant"
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
 	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/kafka"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/redis"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/telemetry"
@@ -48,6 +50,8 @@ func run() error {
 
 	logger := telemetry.NewLogger(os.Stdout, cfg.Log.Level, cfg.Log.Format, cfg.Log.AddSource)
 	slog.SetDefault(logger)
+
+	meters := metrics.New()
 
 	// Signals are handled here rather than by Hertz's Spin so that shutdown is
 	// ordered: stop accepting requests, drain, then close dependencies. Closing
@@ -152,6 +156,25 @@ func run() error {
 	ingestor := webhook.NewIngestor(db, webhookRegistry, webhook.NewRepository(),
 		outbox.NewWriter(), topics, logger)
 
+	// Correctness is asserted continuously rather than after the fact. A load
+	// test that reports throughput while the ledger is quietly unbalanced is a
+	// failed run that looks like a passing one, so the checking has to happen
+	// while the traffic is flowing.
+	checker := invariant.NewChecker(db, meters, logger)
+	go func() {
+		if err := checker.Run(ctx, cfg.Observability.CheckInterval); err != nil {
+			logger.ErrorContext(ctx, "invariant checker stopped", slog.Any("error", err))
+		}
+	}()
+
+	sampler := invariant.NewDepthSampler(db, producerClient, topics,
+		cfg.Observability.ConsumerGroup, meters, logger)
+	go func() {
+		if err := sampler.Run(ctx, cfg.Observability.CheckInterval); err != nil {
+			logger.ErrorContext(ctx, "depth sampler stopped", slog.Any("error", err))
+		}
+	}()
+
 	srv := transport.New(cfg, transport.Deps{
 		Logger: logger,
 		DB:     db,
@@ -163,6 +186,7 @@ func run() error {
 		PaymentService:  paymentService,
 		IdempotencyRepo: idempotencyRepo,
 		WebhookIngestor: ingestor,
+		Metrics:         meters,
 	})
 
 	errCh := make(chan error, 1)

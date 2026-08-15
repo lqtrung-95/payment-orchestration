@@ -331,6 +331,18 @@ passes whether or not the customer was charged.
 **Rounding is unbiased** — zero drift across a thousand exact ties, which
 half-up fails.
 
+**Correctness under load** — across **164,933 payments** created by k6 against
+the live stack: zero ledger imbalance, zero double charges, zero lost payments.
+Four requests failed, all `statement timeout` on the idempotency claim while the
+host was badly oversubscribed — the system shed work rather than corrupting
+state. The invariant checker runs *during* the load, because a run that reports
+throughput while the ledger is quietly unbalanced is a failed run that looks
+like a passing one. It is itself tested against seeded violations: a checker
+that always returned zero would pass every load test ever run against it.
+
+No throughput figure accompanies this, on purpose —
+[`docs/benchmarks/`](docs/benchmarks/) explains why.
+
 **Webhooks under chaos** — 30 payments against the asynchronous provider with
 every webhook fault live, so the outcome could only ever arrive by callback:
 
@@ -556,13 +568,19 @@ Stated plainly, because a README that omits them is not worth reading.
   every row; routing across physical databases comes later. Storing it now is
   the point — backfilling a shard key across a populated ledger means rewriting
   every row while the service stays online.
-- **No throughput numbers yet.** Load testing is Phase 09. This README will not
-  carry a throughput figure until one has actually been measured.
+- **Still no throughput number.** Load testing is built and run
+  ([`loadtest/`](loadtest/), [`docs/benchmarks/`](docs/benchmarks/)), but the
+  only machine available was at a load average of 46 on 10 cores and repeated
+  runs of the same profile varied between 33 and 428 requests/second. That
+  spread measures a laptop, not this system, so no figure is published. What
+  *was* measured is recorded — including 164,933 payments created with zero
+  invariant violations.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
-- **Consumer lag is not exported.** A message stuck in a retry tier is invisible
-  without inspecting Kafka by hand — which is precisely how the consumer stall
-  above was found, by hand, during a demo. Phase 09 fixes this.
+- **Tracing is not built.** Metrics and the invariant checker are; a single
+  trace spanning API → Kafka → provider → webhook → ledger is not, so
+  correlating one payment across the pipeline still means grepping by
+  request id.
 - **`processed_events` and `webhook_events_raw` grow unbounded** — both need
   pruning, and the raw payloads may carry PII, so that one also needs a
   retention window and encryption at rest.
@@ -585,8 +603,8 @@ Stated plainly, because a README that omits them is not worth reading.
 | 05 | Webhook ingest, dedup, out-of-order tolerance | Done |
 | 06 | Payment instrument binding + lifecycle | Skipped |
 | 07 | FX conversion + settlement reconciliation | Done |
-| 08 | Sharding + cross-shard transactions (TCC) | Next |
-| 09 | OpenTelemetry, load + chaos testing | |
+| 08 | Sharding + cross-shard transactions (TCC) | |
+| 09 | Metrics, invariant checker, load + chaos testing | Partly done |
 | 10 | Architecture docs and demo | |
 
 Phases 01–05 are the shippable core: a payment can be created, authorized
