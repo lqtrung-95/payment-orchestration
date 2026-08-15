@@ -217,6 +217,13 @@ the same disagreement rather than raising it again, and any decision recorded
 against it survives. Closing a break demands an actor and a reason, enforced by a
 `CHECK` as well as in Go.
 
+The two explained categories close themselves, and for opposite reasons. FX
+drift is real money, so it writes the adjustment — `Dr clearing / Cr fx gain
+and loss` in the settlement currency — and the break links to the entry that
+justifies it. A timing cutoff moves nothing, so it posts nothing; inventing an
+entry there would invent a movement. The automated actor is still recorded,
+because *"who closed this"* needs an answer even when the answer is "nobody".
+
 ### The provider misbehaves on purpose
 
 `cmd/pspsim` is a separate process implementing a deliberately unreliable
@@ -245,7 +252,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 158 tests, green in
+Measured on this repo, not projected. 162 tests, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -539,9 +546,10 @@ Stated plainly, because a README that omits them is not worth reading.
 - **No reaper for expired idempotency records**, so that table grows unbounded.
 - **Refund has no HTTP surface.** It exists on the aggregate and is tested, but
   is not exposed and refund settlement rows are not classified.
-- **FX gain/loss is detected but not posted.** Drift is classified and reported;
-  no adjustment entry is written, so rate movement is visible rather than
-  accounted. The largest remaining gap in reconciliation.
+- **The settlement entry is not written.** FX drift posts to fx gain/loss, but
+  nothing moves the original balance out of clearing into the bank, so a
+  converted payment still shows outstanding in its charge currency after
+  settling. The remaining half of the cross-currency picture.
 - **Reconciliation is unbenchmarked.** It loads a file and its ledger window
   into memory, which suits demo scale; the 100k-row target is unmeasured.
 - **Sharding is decided, not implemented.** The key is derived and stored on

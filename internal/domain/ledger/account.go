@@ -65,7 +65,7 @@ const (
 	PurposeClearing   Purpose = "clearing"     // asset: funds a provider owes us
 	PurposePayable    Purpose = "payable"      // liability: funds we owe a merchant
 	PurposeFeeRevenue Purpose = "fee_revenue"  // revenue: our fee
-	PurposeFXGainLoss Purpose = "fx_gain_loss" // equity: rate movement between auth and settlement
+	PurposeFXGainLoss Purpose = "fx_gain_loss" // revenue: rate movement between auth and settlement
 	PurposeSettlement Purpose = "settlement"   // asset: funds received into our bank
 )
 

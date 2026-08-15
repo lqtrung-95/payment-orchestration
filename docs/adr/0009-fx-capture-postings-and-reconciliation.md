@@ -105,6 +105,15 @@ rather than by what the row says. A capture outside the file's window is not
 missing — it settles in the next file — and reporting it as lost trains
 operators to ignore the category.
 
+### The settlement amount is its own column
+
+`gross_minor` is what the customer was charged; `settled_minor` is what lands in
+our account, in `settlement_currency`. They were briefly the same column, which
+meant one field held either a EUR figure or a USD one depending on the value of
+a different field. The arithmetic happened to work because both sides made the
+same assumption — the worst kind of correct. The three FX fields are now
+required together, enforced by a CHECK.
+
 ### Only explained categories may auto-resolve
 
 `fx_drift` and `timing_cutoff`, and both because the difference is *explained*
@@ -133,9 +142,13 @@ survives.
   reproducible `fee_mismatch` rather than a hypothetical one.
 - `settlement_files`, `settlement_rows`, and `recon_breaks` grow without bound
   and hold financial data; they need retention and encryption at rest.
-- Adjustment entries are modelled — `recon_breaks.adjustment_entry_id` exists —
-  but nothing writes one yet, so resolving a break records a decision without
-  moving money.
+- Auto-resolution writes an adjustment entry for `fx_drift` and none for
+  `timing_cutoff`, which is the distinction that matters: one is money that
+  moved, the other is a payment arriving in the next file. Resolving any other
+  category by hand still records a decision without an entry.
+- The settlement entry — moving the balance out of the charge-currency clearing
+  account and into the bank — is not built, so that account still shows a
+  converted payment outstanding after it has settled.
 - The 100k-rows-in-60s target is unmeasured. Reconciliation currently loads a
   file and its ledger window entirely into memory, which is fine at demo scale
   and is the first thing to revisit under load.

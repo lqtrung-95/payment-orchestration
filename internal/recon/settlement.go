@@ -28,10 +28,14 @@ type Row struct {
 	Fee   money.Money
 	Net   money.Money
 
-	// SettlementCurrency and SettlementRate are set when the provider settled in
-	// a different currency than it charged in.
+	// SettlementCurrency, SettlementRateNano and Settled describe a converted
+	// payment: what we will actually be paid, in the currency we will be paid
+	// in, and the rate used to get there. Gross stays in the charge currency —
+	// carrying both in one field is how a EUR figure and a USD one end up
+	// indistinguishable.
 	SettlementCurrency money.Currency
 	SettlementRateNano int64
+	Settled            money.Money
 
 	SettledAt time.Time
 
@@ -44,7 +48,8 @@ type Row struct {
 func (r Row) HasFX() bool {
 	return r.SettlementCurrency != "" &&
 		r.SettlementCurrency != r.Gross.Currency() &&
-		r.SettlementRateNano > 0
+		r.SettlementRateNano > 0 &&
+		r.Settled.IsValid()
 }
 
 // File is a settlement file and the window it claims to cover.

@@ -23,6 +23,7 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/recon"
 	"github.com/lequoctrung/payment-orchestrator/internal/recon/breaks"
 	fxstore "github.com/lequoctrung/payment-orchestrator/internal/store/fx"
+	ledgerstore "github.com/lequoctrung/payment-orchestrator/internal/store/ledger"
 )
 
 const usage = `usage: reconctl <command> [flags]
@@ -83,7 +84,7 @@ func open(ctx context.Context) (*deps, func(), error) {
 	service := recon.NewService(db,
 		recon.NewRegistry(recon.NewSimulatorParser(cfg.PSP.DefaultProvider)),
 		recon.NewRepository(), recon.NewLedgerReader(), fxstore.NewRepository(),
-		recon.DefaultTolerances(), logger)
+		ledgerstore.NewRepository(), recon.DefaultTolerances(), logger)
 
 	return &deps{db: db, service: service, repo: recon.NewRepository()}, db.Close, nil
 }

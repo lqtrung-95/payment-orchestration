@@ -83,32 +83,16 @@ func (c *Classifier) ClassifyPair(pair Pair, lock *fx.Lock) (*Break, error) {
 		}, nil
 	}
 
+	// 2. A converted payment is judged on the conversion, before any
+	//    same-currency comparison. Gross is in the charge currency and will
+	//    match; the disagreement, if there is one, lives in what actually lands.
+	if row.HasFX() && lock != nil {
+		return c.classifyConverted(*row, *record, *lock)
+	}
+
 	grossDelta, err := row.Gross.Sub(record.Captured)
 	if err != nil {
 		return nil, err
-	}
-
-	// 2. FX drift, before the generic amount check: the difference is real but
-	//    explained, and calling it an unexplained mismatch would send somebody
-	//    chasing a provider that did nothing wrong.
-	if !grossDelta.IsZero() && row.HasFX() && lock != nil {
-		explained, err := c.explainedByFX(*row, *record, *lock)
-		if err != nil {
-			return nil, err
-		}
-		if explained {
-			return &Break{
-				Category:        breaks.FXDrift,
-				MatchKey:        row.ProviderReference,
-				TransactionID:   &record.TransactionID,
-				SettlementRowID: &row.ID,
-				Expected:        &record.Captured,
-				Actual:          &row.Gross,
-				Delta:           &grossDelta,
-				Detail: fmt.Sprintf("settled at %d nano against locked %d nano",
-					row.SettlementRateNano, lock.Rate.Nano),
-			}, nil
-		}
 	}
 
 	// 3. Gross agrees but the net does not: the provider applied a different
@@ -153,45 +137,75 @@ func (c *Classifier) ClassifyPair(pair Pair, lock *fx.Lock) (*Break, error) {
 	}, nil
 }
 
-// explainedByFX reports whether the gross difference is accounted for by the
-// settlement rate differing from the locked one.
+// classifyConverted judges a payment the provider converted before settling.
 //
-// The test is not "is the difference small". It is "does applying the rate the
-// provider says it used reproduce the figure it sent" — a difference of the
-// right size for the wrong reason is still unexplained, and treating size alone
-// as the criterion is how a genuine error gets closed as drift.
-func (c *Classifier) explainedByFX(row Row, record LedgerRecord, lock fx.Lock) (bool, error) {
+// Two distinct questions, asked in order. First: are the provider's own numbers
+// self-consistent — does the rate it states actually produce the amount it says
+// it is paying? If not, the figures are wrong in a way no rate explains, and
+// calling that drift would close a real error as expected noise.
+//
+// Only then: does its rate differ from the one we locked? That difference is
+// the FX gain or loss, and it is the thing worth recording.
+func (c *Classifier) classifyConverted(row Row, record LedgerRecord, lock fx.Lock) (*Break, error) {
 	settlementRate, err := fx.NewRate(
 		record.Captured.Currency(), row.SettlementCurrency,
 		row.SettlementRateNano, "settlement", row.SettledAt,
 	)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
-	// What the provider's own rate implies it should have settled.
 	implied, err := settlementRate.Convert(record.Captured)
 	if err != nil {
-		return false, err
+		return nil, err
+	}
+	residual, err := row.Settled.Sub(implied)
+	if err != nil {
+		return nil, err
 	}
 
-	// Compared against what it actually sent, in the settlement currency.
-	actual, err := money.New(row.Gross.Amount(), row.SettlementCurrency)
-	if err != nil {
-		return false, err
-	}
-	residual, err := actual.Sub(implied)
-	if err != nil {
-		return false, err
-	}
-
-	// A small residual is rounding; a large one means the stated rate does not
-	// explain the figure, whatever the size of the original difference.
 	tolerance, err := implied.MulRatio(c.tolerances.FXDriftBps, 10_000)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return absMinor(residual) <= absMinor(tolerance), nil
+	if absMinor(residual) > absMinor(tolerance) {
+		return &Break{
+			Category:        breaks.AmountMismatch,
+			MatchKey:        row.ProviderReference,
+			TransactionID:   &record.TransactionID,
+			SettlementRowID: &row.ID,
+			Expected:        &implied,
+			Actual:          &row.Settled,
+			Delta:           &residual,
+			Detail: fmt.Sprintf("settled %s, but rate %d nano on %s implies %s",
+				row.Settled, row.SettlementRateNano, record.Captured, implied),
+		}, nil
+	}
+
+	// Self-consistent. Compare against the rate we promised.
+	atLocked, err := lock.Rate.Convert(record.Captured)
+	if err != nil {
+		return nil, err
+	}
+	drift, err := row.Settled.Sub(atLocked)
+	if err != nil {
+		return nil, err
+	}
+	if drift.IsZero() {
+		return nil, nil // settled at exactly the locked rate
+	}
+
+	return &Break{
+		Category:        breaks.FXDrift,
+		MatchKey:        row.ProviderReference,
+		TransactionID:   &record.TransactionID,
+		SettlementRowID: &row.ID,
+		Expected:        &atLocked,
+		Actual:          &row.Settled,
+		Delta:           &drift,
+		Detail: fmt.Sprintf("settled at %d nano against locked %d nano",
+			row.SettlementRateNano, lock.Rate.Nano),
+	}, nil
 }
 
 func absMinor(m money.Money) int64 {

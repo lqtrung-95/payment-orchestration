@@ -85,11 +85,11 @@ Eight categories. `fx_drift` and `timing_cutoff` are the ones that signal you ha
 - [x] Multi-currency ledger accounts — created on demand, per currency
 - [x] FX rate provider + historical storage
 - [x] Rate lock with TTL, append-only, expiry enforced inside Convert
-- [ ] FX gain/loss posting — **not built**, see Deferred
+- [x] FX gain/loss posting — auto-resolving fx_drift writes the adjustment entry
 - [x] Per-provider settlement parsers
 - [x] Matching engine — exact only; fuzzy deliberately not built, see Deviations
 - [x] Eight-category classifier
-- [x] Break resolution workflow — adjustments modelled, not written
+- [x] Break resolution workflow + adjustment entries
 - [x] Seeded settlement generator
 - [x] `reconctl` + summary report with exposure
 - [x] Auto-resolve rules — `fx_drift` and `timing_cutoff` only
@@ -117,6 +117,16 @@ Eight categories. `fx_drift` and `timing_cutoff` are the ones that signal you ha
 
 ## Verified on 2026-08-15
 
+- **FX drift is detected, auto-resolved, and posted.** 200.00 EUR locked at
+  1.085 and settled at 1.09 produces a 1.00 USD gain, written as
+  `Dr clearing / Cr fx_gain_loss` in the settlement currency, linked from the
+  break, and closed with an attributed automated actor. The ledger still
+  balances after the adjustment.
+- **Timing cutoffs auto-resolve without posting anything** — the payment settles
+  in the next file, so inventing an entry would invent a movement.
+- **Everything else stays open.** An unexplained amount mismatch is never closed
+  automatically, and a provider whose own figures contradict its stated rate is
+  classified as an amount mismatch rather than excused as drift.
 - **All eight categories detected and correctly classified** from a generated
   file with one defect of each kind planted deliberately, asserted by count. A
   clean payment in the same file reconciles silently, so the test also proves
@@ -159,14 +169,15 @@ unimplementable until capture existed, which the plan did not account for.
 
 ## Deferred
 
-- **FX gain/loss posting is not written.** The account purpose exists and the
-  drift is detected and reported, but no adjustment entry is raised, so rate
-  movement is visible rather than accounted. This is the largest remaining gap
-  in the phase and the honest limit on the "keeps a cross-currency ledger
-  balanced" claim.
-- **Adjustment entries generally.** `recon_breaks.adjustment_entry_id` is
-  modelled and never populated: resolving a break records a decision without
-  moving money.
+- **The settlement entry is not written.** FX drift now posts to fx gain/loss
+  against a settlement-currency clearing account, but the entry that moves the
+  original balance out of the charge-currency clearing account and into the bank
+  does not exist. The charge-currency clearing balance therefore still shows the
+  payment outstanding after settlement. This is the remaining half of the
+  cross-currency picture.
+- **Only fx_drift raises an adjustment.** Resolving any other category by hand
+  records a decision without moving money; `reconctl resolve` cannot attach an
+  entry.
 - **100k rows in under 60s is unmeasured.** Reconciliation loads a file and its
   ledger window into memory, which suits demo scale and is the first thing to
   revisit under load.

@@ -60,7 +60,7 @@ func Generate(in GeneratorInput) (string, []Defect, error) {
 		lines   []string
 		applied []Defect
 	)
-	lines = append(lines, "reference,gross_minor,fee_minor,net_minor,currency,settled_at,settlement_currency,settlement_rate_nano")
+	lines = append(lines, "reference,gross_minor,fee_minor,net_minor,currency,settled_at,settlement_currency,settlement_rate_nano,settled_minor")
 
 	for _, record := range in.Records {
 		defects := byReference[record.ProviderReference]
@@ -96,7 +96,7 @@ func Generate(in GeneratorInput) (string, []Defect, error) {
 			return "", nil, fmt.Errorf("defect %s requires a reference", d.Category)
 		}
 		reference := fmt.Sprintf("ch_phantom_%d", i)
-		lines = append(lines, fmt.Sprintf("%s,%d,%d,%d,%s,%s,,",
+		lines = append(lines, fmt.Sprintf("%s,%d,%d,%d,%s,%s,,,",
 			reference, 4200, 130, 4070, "USD", in.SettledAt.UTC().Format(time.RFC3339)))
 		applied = append(applied, Defect{Category: breaks.MissingInternally, Reference: reference})
 	}
@@ -111,7 +111,7 @@ func renderRow(record LedgerRecord, defects []Defect, settledAt time.Time) (stri
 	fee := record.Fee.Amount()
 	currency := record.Captured.Currency()
 	settlementCurrency := ""
-	var rateNano int64
+	var rateNano, settled int64
 	when := settledAt
 
 	var applied []Defect
@@ -135,15 +135,16 @@ func renderRow(record LedgerRecord, defects []Defect, settledAt time.Time) (stri
 
 		case breaks.FXDrift:
 			// Converted at a rate close to, but not exactly, the locked one.
-			// The gross is restated in the settlement currency using that rate,
-			// which is what makes the drift explainable rather than arbitrary.
+			// Gross stays in the charge currency; the settled amount is what the
+			// provider's own rate produces, so its figures are self-consistent
+			// and the only disagreement is with the rate we promised.
 			settlementCurrency = "USD"
 			rateNano = 1_090_000_000
 			converted, err := convertForSettlement(record, rateNano)
 			if err != nil {
 				return "", nil, err
 			}
-			gross = converted
+			settled = converted
 			applied = append(applied, d)
 
 		case breaks.MissingAtPSP, breaks.TimingCutoff, breaks.DuplicateSettlement, breaks.MissingInternally:
@@ -154,17 +155,19 @@ func renderRow(record LedgerRecord, defects []Defect, settledAt time.Time) (stri
 		}
 	}
 
-	// The two FX columns are written together or not at all: a rate with no
-	// currency cannot be applied to anything, and the parser refuses the pair.
-	renderedRate := ""
+	// The three FX columns are written together or not at all: an amount with
+	// no currency cannot be compared to anything, and the parser refuses a
+	// partial set.
+	renderedRate, renderedSettled := "", ""
 	if settlementCurrency != "" {
 		renderedRate = strconv.FormatInt(rateNano, 10)
+		renderedSettled = strconv.FormatInt(settled, 10)
 	}
 
 	net := gross - fee
-	return fmt.Sprintf("%s,%d,%d,%d,%s,%s,%s,%s",
+	return fmt.Sprintf("%s,%d,%d,%d,%s,%s,%s,%s,%s",
 		record.ProviderReference, gross, fee, net, currency,
-		when.UTC().Format(time.RFC3339), settlementCurrency, renderedRate), applied, nil
+		when.UTC().Format(time.RFC3339), settlementCurrency, renderedRate, renderedSettled), applied, nil
 }
 
 // convertForSettlement restates a captured amount at the provider's rate.

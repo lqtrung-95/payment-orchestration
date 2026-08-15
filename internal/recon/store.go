@@ -58,8 +58,8 @@ func (r *Repository) InsertFile(ctx context.Context, q postgres.Querier, file *F
 	const insertRow = `
 		INSERT INTO settlement_rows
 			(file_id, line_number, provider_reference, gross_minor, fee_minor, net_minor,
-			 currency, settlement_currency, settlement_rate_nano, settled_at, raw)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, 0), $10, $11)
+			 currency, settlement_currency, settlement_rate_nano, settled_minor, settled_at, raw)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, 0), NULLIF($10, -1), $11, $12)
 		RETURNING id`
 
 	for i := range file.Rows {
@@ -68,7 +68,7 @@ func (r *Repository) InsertFile(ctx context.Context, q postgres.Querier, file *F
 			file.ID, row.LineNumber, row.ProviderReference,
 			row.Gross.Amount(), row.Fee.Amount(), row.Net.Amount(),
 			string(row.Gross.Currency()), string(row.SettlementCurrency), row.SettlementRateNano,
-			row.SettledAt, row.Raw,
+			settledMinorOrSentinel(*row), row.SettledAt, row.Raw,
 		).Scan(&row.ID); err != nil {
 			return false, fmt.Errorf("insert settlement row %d: %w", row.LineNumber, err)
 		}
@@ -104,7 +104,7 @@ func (r *Repository) loadRows(ctx context.Context, q postgres.Querier, fileID uu
 	const query = `
 		SELECT id, line_number, provider_reference, gross_minor, fee_minor, net_minor,
 		       currency, COALESCE(settlement_currency, ''), COALESCE(settlement_rate_nano, 0),
-		       settled_at, raw
+		       COALESCE(settled_minor, 0), settled_at, raw
 		FROM settlement_rows WHERE file_id = $1 ORDER BY line_number`
 
 	rows, err := q.Query(ctx, query, fileID)
@@ -117,12 +117,12 @@ func (r *Repository) loadRows(ctx context.Context, q postgres.Querier, fileID uu
 	for rows.Next() {
 		var (
 			row                      Row
-			gross, fee, net          int64
+			gross, fee, net, settled int64
 			currency, settleCurrency string
 		)
 		if err := rows.Scan(&row.ID, &row.LineNumber, &row.ProviderReference,
 			&gross, &fee, &net, &currency, &settleCurrency, &row.SettlementRateNano,
-			&row.SettledAt, &row.Raw); err != nil {
+			&settled, &row.SettledAt, &row.Raw); err != nil {
 			return nil, fmt.Errorf("scan settlement row: %w", err)
 		}
 
@@ -137,7 +137,12 @@ func (r *Repository) loadRows(ctx context.Context, q postgres.Querier, fileID uu
 			return nil, err
 		}
 		row.FileID = fileID
-		row.SettlementCurrency = money.Currency(settleCurrency)
+		if settleCurrency != "" {
+			row.SettlementCurrency = money.Currency(settleCurrency)
+			if row.Settled, err = money.New(settled, row.SettlementCurrency); err != nil {
+				return nil, err
+			}
+		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -201,8 +206,52 @@ func (r *Repository) SaveBreak(
 	return true, nil
 }
 
-// Resolve records a decision against a break.
+// BreakID returns the identity of a break by its natural key.
+func (r *Repository) BreakID(
+	ctx context.Context,
+	q postgres.Querier,
+	fileID uuid.UUID,
+	category breaks.Category,
+	matchKey string,
+) (uuid.UUID, error) {
+	const query = `
+		SELECT id FROM recon_breaks
+		WHERE file_id = $1 AND category = $2 AND match_key = $3`
+
+	var id uuid.UUID
+	if err := q.QueryRow(ctx, query, fileID, string(category), matchKey).Scan(&id); err != nil {
+		return uuid.Nil, fmt.Errorf("find break %s/%s: %w", category, matchKey, err)
+	}
+	return id, nil
+}
+
+// ShardKeyFor returns the shard key a transaction's entries belong to, so an
+// adjustment lands on the same shard as the capture it corrects.
+func (r *Repository) ShardKeyFor(ctx context.Context, q postgres.Querier, transactionID uuid.UUID) (string, error) {
+	const query = `SELECT shard_key FROM payment_transactions WHERE id = $1`
+
+	var shardKey string
+	if err := q.QueryRow(ctx, query, transactionID).Scan(&shardKey); err != nil {
+		return "", fmt.Errorf("shard key for %s: %w", transactionID, err)
+	}
+	return shardKey, nil
+}
+
+// Resolve records a decision against a break using the pool.
 func (r *Repository) Resolve(
+	ctx context.Context,
+	q postgres.Querier,
+	breakID uuid.UUID,
+	res breaks.Resolution,
+	adjustmentEntryID *uuid.UUID,
+) error {
+	return r.ResolveTx(ctx, q, breakID, res, adjustmentEntryID)
+}
+
+// ResolveTx records a decision using the caller's querier, so an adjustment
+// entry and the decision it justifies commit together. A decision that survives
+// without its entry is a break marked resolved against money that never moved.
+func (r *Repository) ResolveTx(
 	ctx context.Context,
 	q postgres.Querier,
 	breakID uuid.UUID,
@@ -235,6 +284,17 @@ func (r *Repository) Resolve(
 		return fmt.Errorf("break %s is not open", breakID)
 	}
 	return nil
+}
+
+// settledMinorOrSentinel returns -1 when there is no conversion, which the
+// insert turns into NULL. A plain zero cannot be used: zero is a legitimate
+// settled amount, and the database refuses a row that has a settlement currency
+// with no amount beside it.
+func settledMinorOrSentinel(row Row) int64 {
+	if !row.HasFX() {
+		return -1
+	}
+	return row.Settled.Amount()
 }
 
 func minorOrNil(m *money.Money) *int64 {

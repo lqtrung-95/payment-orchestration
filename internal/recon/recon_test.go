@@ -16,6 +16,7 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/recon"
 	"github.com/lequoctrung/payment-orchestrator/internal/recon/breaks"
 	fxstore "github.com/lequoctrung/payment-orchestrator/internal/store/fx"
+	ledgerstore "github.com/lequoctrung/payment-orchestrator/internal/store/ledger"
 	"github.com/lequoctrung/payment-orchestrator/internal/testsupport"
 )
 
@@ -42,10 +43,25 @@ func newHarness(t *testing.T) *harness {
 			recon.NewRepository(),
 			recon.NewLedgerReader(),
 			fxstore.NewRepository(),
+			ledgerstore.NewRepository(),
 			recon.DefaultTolerances(),
 			logger),
 		seeder: newSeeder(db),
 	}
+}
+
+// ledgerTotals sums every posting by direction, across all accounts.
+func (h *harness) ledgerTotals(t *testing.T) (debits, credits int64) {
+	t.Helper()
+
+	err := h.db.Pool().QueryRow(context.Background(), `
+		SELECT COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'debit'), 0),
+		       COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'credit'), 0)
+		FROM postings`).Scan(&debits, &credits)
+	if err != nil {
+		t.Fatalf("sum postings: %v", err)
+	}
+	return debits, credits
 }
 
 // settledAt is the nominal settlement instant every fixture hangs off.
@@ -323,5 +339,207 @@ func TestFXRateHelpersRemainConsistent(t *testing.T) {
 	}
 	if _, err := rate.Convert(money.MustNew(100_00, "EUR")); err != nil {
 		t.Fatalf("Convert: %v", err)
+	}
+}
+
+// Detecting drift and accounting for it are different things. Until an entry
+// exists the books still say we are owed what we originally booked, and the
+// discrepancy lives only in a report — which is the state reconciliation is
+// supposed to end.
+func TestFXDriftIsAutoResolvedAndPostedToTheLedger(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	record := h.seeder.capture(t, 0, money.MustNew(200_00, "EUR"), settledAt)
+	h.seeder.lockRate(t, record.TransactionID, "EUR", "USD", 1_085_000_000)
+
+	debitsBefore, creditsBefore := h.ledgerTotals(t)
+
+	content, _, err := recon.Generate(recon.GeneratorInput{
+		Provider:  testProvider,
+		Records:   []recon.LedgerRecord{record},
+		Defects:   []recon.Defect{{Category: breaks.FXDrift, Reference: record.ProviderReference}},
+		SettledAt: settledAt,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	file, _, err := h.service.Ingest(ctx, testProvider, "drift.csv", strings.NewReader(content))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	report, err := h.service.Reconcile(ctx, file.ID, "test")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.ByCategory[breaks.FXDrift] != 1 {
+		t.Fatalf("fx_drift breaks = %d, want 1", report.ByCategory[breaks.FXDrift])
+	}
+	if report.AutoResolved != 1 {
+		t.Errorf("auto-resolved = %d, want 1", report.AutoResolved)
+	}
+
+	// Closed, attributed, and carrying the entry that justifies it.
+	var (
+		status, actor, note string
+		entryID             *uuid.UUID
+	)
+	if err := h.db.Pool().QueryRow(ctx, `
+		SELECT status, COALESCE(resolved_by,''), COALESCE(resolution_note,''), adjustment_entry_id
+		FROM recon_breaks WHERE category = 'fx_drift'`).Scan(&status, &actor, &note, &entryID); err != nil {
+		t.Fatalf("read break: %v", err)
+	}
+	if status != string(breaks.StatusResolved) {
+		t.Errorf("status = %s, want resolved", status)
+	}
+	if actor == "" || note == "" {
+		t.Errorf("auto-resolution left actor %q and note %q; both must be recorded", actor, note)
+	}
+	if entryID == nil {
+		t.Fatal("no adjustment entry linked; the drift was detected but never accounted")
+	}
+
+	// The adjustment balances, like every other entry.
+	debitsAfter, creditsAfter := h.ledgerTotals(t)
+	if debitsAfter == debitsBefore {
+		t.Error("no postings were written for the drift")
+	}
+	if debitsAfter != creditsAfter {
+		t.Errorf("ledger does not balance after the adjustment: debits %d, credits %d",
+			debitsAfter, creditsAfter)
+	}
+	if (debitsAfter - debitsBefore) != (creditsAfter - creditsBefore) {
+		t.Error("the adjustment itself does not balance")
+	}
+
+	// And it landed in the FX gain/loss account, not somewhere convenient.
+	var gainLossPostings int
+	if err := h.db.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM postings p
+		JOIN ledger_accounts a ON a.id = p.account_id
+		WHERE a.purpose = 'fx_gain_loss'`).Scan(&gainLossPostings); err != nil {
+		t.Fatalf("count fx postings: %v", err)
+	}
+	if gainLossPostings != 1 {
+		t.Errorf("fx_gain_loss postings = %d, want 1", gainLossPostings)
+	}
+}
+
+// A timing cutoff is not a discrepancy — the payment settles in the next file —
+// so it closes with no entry. Posting one would invent a movement.
+func TestTimingCutoffAutoResolvesWithoutPostingAnything(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	record := h.seeder.capture(t, 0, money.MustNew(80_00, "USD"), settledAt.Add(24*time.Hour))
+	// A second payment inside the window, so the file has rows and a period.
+	inWindow := h.seeder.capture(t, 1, money.MustNew(10_00, "USD"), settledAt)
+
+	debitsBefore, _ := h.ledgerTotals(t)
+
+	content, _, err := recon.Generate(recon.GeneratorInput{
+		Provider:  testProvider,
+		Records:   []recon.LedgerRecord{record, inWindow},
+		Defects:   []recon.Defect{{Category: breaks.TimingCutoff, Reference: record.ProviderReference}},
+		SettledAt: settledAt,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	file, _, err := h.service.Ingest(ctx, testProvider, "cutoff.csv", strings.NewReader(content))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	report, err := h.service.Reconcile(ctx, file.ID, "test")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.ByCategory[breaks.TimingCutoff] != 1 {
+		t.Fatalf("timing_cutoff breaks = %d, want 1", report.ByCategory[breaks.TimingCutoff])
+	}
+	if report.AutoResolved != 1 {
+		t.Errorf("auto-resolved = %d, want 1", report.AutoResolved)
+	}
+
+	if debitsAfter, _ := h.ledgerTotals(t); debitsAfter != debitsBefore {
+		t.Errorf("postings changed from %d to %d; a timing cutoff moves no money",
+			debitsBefore, debitsAfter)
+	}
+}
+
+// Everything else waits for a person. An amount mismatch might be the
+// provider's error or ours, and closing it automatically is how a real
+// discrepancy disappears as noise.
+func TestUnexplainedBreaksAreLeftOpen(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	record := h.seeder.capture(t, 0, money.MustNew(100_00, "USD"), settledAt)
+	content, _, err := recon.Generate(recon.GeneratorInput{
+		Provider:  testProvider,
+		Records:   []recon.LedgerRecord{record},
+		Defects:   []recon.Defect{{Category: breaks.AmountMismatch, Reference: record.ProviderReference}},
+		SettledAt: settledAt,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	file, _, err := h.service.Ingest(ctx, testProvider, "open.csv", strings.NewReader(content))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	report, err := h.service.Reconcile(ctx, file.ID, "test")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.AutoResolved != 0 {
+		t.Errorf("auto-resolved = %d, want 0 — an unexplained break needs a human", report.AutoResolved)
+	}
+
+	var status string
+	if err := h.db.Pool().QueryRow(ctx,
+		`SELECT status FROM recon_breaks WHERE category = 'amount_mismatch'`).Scan(&status); err != nil {
+		t.Fatalf("read break: %v", err)
+	}
+	if status != string(breaks.StatusOpen) {
+		t.Errorf("status = %s, want open", status)
+	}
+}
+
+// A provider whose own numbers do not add up is not drifting — its figures are
+// wrong in a way no rate explains, and calling that drift would close a real
+// error as expected noise.
+func TestSelfInconsistentConversionIsNotCalledDrift(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	record := h.seeder.capture(t, 0, money.MustNew(200_00, "EUR"), settledAt)
+	h.seeder.lockRate(t, record.TransactionID, "EUR", "USD", 1_085_000_000)
+
+	// A rate of 1.09 on 200.00 EUR implies 218.00 USD; this file claims 300.00.
+	content := "reference,gross_minor,fee_minor,net_minor,currency,settled_at,settlement_currency,settlement_rate_nano,settled_minor\n" +
+		record.ProviderReference + ",20000,605,19395,EUR," +
+		settledAt.UTC().Format(time.RFC3339) + ",USD,1090000000,30000\n"
+
+	file, _, err := h.service.Ingest(ctx, testProvider, "inconsistent.csv", strings.NewReader(content))
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	report, err := h.service.Reconcile(ctx, file.ID, "test")
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got := report.ByCategory[breaks.AmountMismatch]; got != 1 {
+		t.Errorf("amount_mismatch = %d, want 1", got)
+	}
+	if got := report.ByCategory[breaks.FXDrift]; got != 0 {
+		t.Errorf("fx_drift = %d, want 0 — inconsistent figures were excused as drift", got)
+	}
+	if report.AutoResolved != 0 {
+		t.Errorf("auto-resolved = %d, want 0", report.AutoResolved)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -23,6 +24,7 @@ type Service struct {
 	repo       *Repository
 	ledger     *LedgerReader
 	fxRepo     *fxstore.Repository
+	adjuster   *Adjuster
 	classifier *Classifier
 	logger     *slog.Logger
 }
@@ -33,12 +35,15 @@ func NewService(
 	repo *Repository,
 	ledger *LedgerReader,
 	fxRepo *fxstore.Repository,
+	ledgerWriter LedgerWriter,
 	tolerances Tolerances,
 	logger *slog.Logger,
 ) *Service {
 	return &Service{
 		db: db, parsers: parsers, repo: repo, ledger: ledger, fxRepo: fxRepo,
-		classifier: NewClassifier(tolerances), logger: logger,
+		adjuster:   NewAdjuster(ledgerWriter),
+		classifier: NewClassifier(tolerances),
+		logger:     logger,
 	}
 }
 
@@ -89,6 +94,10 @@ type Report struct {
 	// NewBreaks counts only those not already recorded for this file, which is
 	// what makes a repeat run visibly a no-op.
 	NewBreaks int
+
+	// AutoResolved counts breaks closed without a human, which only the
+	// explained categories are eligible for.
+	AutoResolved int
 
 	// Exposure is the total absolute delta across breaks that have one, in
 	// minor units per currency. What is actually at stake, rather than a count.
@@ -146,11 +155,22 @@ func (s *Service) Reconcile(ctx context.Context, fileID uuid.UUID, actor string)
 				return err
 			}
 			report.ByCategory[b.Category]++
-			if isNew {
-				report.NewBreaks++
-			}
 			if b.Delta != nil {
 				report.Exposure[string(b.Delta.Currency())] += absMinor(*b.Delta)
+			}
+			if !isNew {
+				// Already raised, and possibly already decided. Re-resolving
+				// would rewrite somebody's decision.
+				continue
+			}
+			report.NewBreaks++
+
+			resolved, err := s.autoResolve(ctx, tx, file, b)
+			if err != nil {
+				return err
+			}
+			if resolved {
+				report.AutoResolved++
 			}
 		}
 
@@ -164,7 +184,8 @@ func (s *Service) Reconcile(ctx context.Context, fileID uuid.UUID, actor string)
 		slog.String("file_id", fileID.String()),
 		slog.Int("matched", report.Matched),
 		slog.Int("breaks", report.Total()),
-		slog.Int("new_breaks", report.NewBreaks))
+		slog.Int("new_breaks", report.NewBreaks),
+		slog.Int("auto_resolved", report.AutoResolved))
 
 	return report, nil
 }
@@ -199,6 +220,57 @@ func (s *Service) classifyAll(ctx context.Context, file File, matched MatchResul
 	}
 
 	return found, nil
+}
+
+// autoResolve closes a break that needs no human, reporting whether it did.
+//
+// Only the two *explained* categories qualify, and they are closed for opposite
+// reasons. FX drift is real money and gets an adjustment entry, so the books
+// stop disagreeing with the provider. A timing cutoff is not a discrepancy at
+// all — the payment settles in the next file — so it is closed with no entry,
+// because posting one would invent a movement that never happened.
+//
+// The actor is recorded as the reconciler rather than left blank. "Who closed
+// this" has to have an answer even when the answer is "nobody, automatically".
+func (s *Service) autoResolve(ctx context.Context, tx pgx.Tx, file File, b Break) (bool, error) {
+	if !b.Category.AutoResolvable() {
+		return false, nil
+	}
+
+	breakID, err := s.repo.BreakID(ctx, tx, file.ID, b.Category, b.MatchKey)
+	if err != nil {
+		return false, err
+	}
+
+	var adjustment *uuid.UUID
+	note := "settles in an adjacent window; no movement to account for"
+
+	if b.Category == breaks.FXDrift {
+		if b.TransactionID == nil {
+			return false, fmt.Errorf("fx drift break %s has no transaction", b.MatchKey)
+		}
+		shardKey, err := s.repo.ShardKeyFor(ctx, tx, *b.TransactionID)
+		if err != nil {
+			return false, err
+		}
+
+		entryID, err := s.adjuster.PostFXDrift(ctx, tx, b, *b.TransactionID, shardKey, file.Provider)
+		if err != nil {
+			return false, err
+		}
+		adjustment = &entryID
+		note = fmt.Sprintf("rate movement accounted to fx gain/loss (%s)", b.Delta)
+	}
+
+	if err := s.repo.ResolveTx(ctx, tx, breakID, breaks.Resolution{
+		Status: breaks.StatusResolved,
+		Actor:  "system:reconciler",
+		Note:   note,
+		At:     time.Now().UTC(),
+	}, adjustment); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // lockFor returns the rate lock held for a pair's transaction, or nil.

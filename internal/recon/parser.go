@@ -52,7 +52,7 @@ func (r *Registry) Get(provider string) (Parser, error) {
 
 // SimulatorParser reads the fault-injecting simulator's settlement format.
 //
-//	reference,gross_minor,fee_minor,net_minor,currency,settled_at,settlement_currency,settlement_rate_nano
+//	reference,gross_minor,fee_minor,net_minor,currency,settled_at,settlement_currency,settlement_rate_nano,settled_minor
 type SimulatorParser struct {
 	name string
 }
@@ -61,7 +61,7 @@ func NewSimulatorParser(name string) *SimulatorParser { return &SimulatorParser{
 
 func (p *SimulatorParser) Provider() string { return p.name }
 
-const simulatorColumns = 8
+const simulatorColumns = 9
 
 func (p *SimulatorParser) Parse(r io.Reader) (File, error) {
 	// The bytes are hashed as they are read, so the identity recorded for the
@@ -137,14 +137,24 @@ func (p *SimulatorParser) parseRow(record []string, line int) (Row, error) {
 		return fail("reference is empty")
 	}
 
-	// The FX columns are optional and must be present together: a rate with no
-	// currency, or a currency with no rate, cannot be applied to anything.
+	// The three FX fields are meaningful only together: an amount with no
+	// currency cannot be compared to anything, and a rate with neither cannot
+	// be applied. The database enforces the same rule.
 	settlementCurrency := strings.TrimSpace(record[6])
 	rawRate := strings.TrimSpace(record[7])
-	if (settlementCurrency == "") != (rawRate == "") {
-		return fail("settlement currency and rate must both be present or both absent")
+	rawSettled := strings.TrimSpace(record[8])
+
+	present := 0
+	for _, field := range []string{settlementCurrency, rawRate, rawSettled} {
+		if field != "" {
+			present++
+		}
 	}
-	if settlementCurrency != "" {
+	if present != 0 && present != 3 {
+		return fail("settlement currency, rate and amount must all be present or all absent")
+	}
+
+	if present == 3 {
 		cur := money.Currency(settlementCurrency)
 		if err := cur.Validate(); err != nil {
 			return fail("settlement currency: %v", err)
@@ -152,6 +162,13 @@ func (p *SimulatorParser) parseRow(record []string, line int) (Row, error) {
 		rate, err := strconv.ParseInt(rawRate, 10, 64)
 		if err != nil || rate <= 0 {
 			return fail("settlement rate %q is not a positive integer", rawRate)
+		}
+		settledMinor, err := strconv.ParseInt(rawSettled, 10, 64)
+		if err != nil {
+			return fail("settled amount %q is not an integer", rawSettled)
+		}
+		if row.Settled, err = money.New(settledMinor, cur); err != nil {
+			return fail("settled amount: %v", err)
 		}
 		row.SettlementCurrency = cur
 		row.SettlementRateNano = rate
