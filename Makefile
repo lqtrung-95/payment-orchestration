@@ -140,6 +140,14 @@ demo: ## Run the narrated end-to-end demo (starts and stops everything itself)
 demo-verify: ## Run the demo with no pauses and assert every claim
 	./scripts/demo.sh --fast
 
+.PHONY: demo-shards
+demo-shards: ## Run the sharding and cross-shard transfer demo (two databases)
+	./scripts/demo-sharding.sh
+
+.PHONY: demo-shards-verify
+demo-shards-verify: ## Run the sharding demo with no pauses and assert every claim
+	./scripts/demo-sharding.sh --fast
+
 .PHONY: faults
 faults: ## Show the simulator's current fault configuration
 	@curl -s $(PSPSIM_URL)/admin/faults

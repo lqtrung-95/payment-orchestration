@@ -1,6 +1,6 @@
 # Phase 10 — Docs, ADRs, Demo, Resume Assets
 
-**Priority:** P0 — do not skip · **Status:** Not started · **Week:** 12 (runs alongside Phase 09)
+**Priority:** P0 — do not skip · **Status:** Partially complete — video outstanding · **Week:** 12 (runs alongside Phase 09)
 
 Nobody clones your repo. A hiring manager gives it 60 seconds. This phase is the difference between three months of work landing and three months of work being invisible.
 
@@ -80,16 +80,16 @@ That last question is the one that separates senior from mid. Have a real answer
 
 ## Todo
 
-- [ ] ADRs 0001–0014
-- [ ] `docs/system-architecture.md` with diagrams
-- [ ] README with above-the-fold discipline
-- [ ] Failure-mode table
-- [ ] `make demo`
-- [ ] Demo video recorded + edited
-- [ ] Benchmarks documented + reproducible
-- [ ] Interview notes
-- [ ] Resume bullets
-- [ ] Repo cleanup pass
+- [x] ADRs — 10 written at decision time rather than the 14 planned; each names a rejected alternative
+- [x] `docs/system-architecture.md` with diagrams — 9 mermaid blocks, all parsed
+- [x] README with above-the-fold discipline
+- [x] Failure-mode table
+- [x] `make demo` — plus `make demo-shards` for the sharding and TCC story
+- [ ] **Demo video recorded + edited** — user action; script below
+- [x] Benchmarks documented + reproducible
+- [x] Interview notes — `interview-preparation-notes.md`
+- [x] Resume bullets — `resume-and-application-assets.md`
+- [x] Repo cleanup pass — no TODOs, no committed secrets, two dead symbols removed
 
 ## Success criteria
 

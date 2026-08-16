@@ -338,7 +338,7 @@ declines for insufficient funds.
 
 ## Verified behaviour
 
-Measured on this repo, not projected. 170 tests, green in
+Measured on this repo, not projected. 224 tests across 22 packages, green in
 [CI](https://github.com/lqtrung-95/payment-orchestration/actions/workflows/ci.yml)
 against a real Postgres.
 
@@ -623,6 +623,14 @@ go run ./cmd/transferctl send -from merchant-a -to merchant-b -amount 12500 -key
 The output states which database each side resolved to and whether the transfer
 actually crossed. `make transfers` lists anything still in flight, and
 `make sweep` resolves transfers whose coordinator stopped.
+
+All of that is also a narrated, self-asserting demo — it creates the second
+database, splits two merchants across them, moves money, and shows the suspense
+legs netting to zero:
+
+```bash
+make demo-shards
+```
 
 ```bash
 make test          # includes integration tests against the live stack

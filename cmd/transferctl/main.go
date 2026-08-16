@@ -30,6 +30,7 @@ const usage = `usage: transferctl <command> [flags]
 
   send    -from M -to M -amount MINOR -currency C -key K   move funds between merchants
   show    -id ID                                           report a transfer's state
+  shard   -merchant M [-quiet]                             report which database a merchant is on
   pending                                                  list transfers not yet resolved
   sweep                                                    resolve transfers whose coordinator stopped
 `
@@ -52,6 +53,8 @@ func run() error {
 		return send(os.Args[2:])
 	case "show":
 		return show(os.Args[2:])
+	case "shard":
+		return shardOf(os.Args[2:])
 	case "pending":
 		return pending()
 	case "sweep":
@@ -140,6 +143,52 @@ func show(args []string) error {
 		return err
 	}
 	printTransfer(router, transfer)
+	return nil
+}
+
+// shardOf answers the question sharding makes people ask first: which database
+// holds this merchant. Needed often enough during an incident that guessing at
+// it with a hash function in a scratch file is worse than a subcommand.
+func shardOf(args []string) error {
+	fs := flag.NewFlagSet("shard", flag.ExitOnError)
+	merchant := fs.String("merchant", "", "merchant id")
+	quiet := fs.Bool("quiet", false, "print `<logical-key> <database>` only, for scripts")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *merchant == "" {
+		return errors.New("-merchant is required")
+	}
+
+	key := sharding.KeyForMerchant(*merchant)
+
+	// Resolved through a router rather than recomputed, so this reports where
+	// reads actually go rather than where they ought to.
+	ctx, router, _, err := deps()
+	if err != nil {
+		return err
+	}
+	defer router.Close()
+	_ = ctx
+
+	physical, err := router.Mapping().Resolve(key)
+	if err != nil {
+		return err
+	}
+
+	if *quiet {
+		fmt.Printf("%s %d\n", key, physical)
+		return nil
+	}
+
+	lo, hi, err := router.Mapping().LogicalRange(physical)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", *merchant)
+	fmt.Printf("  logical shard   %s\n", key)
+	fmt.Printf("  database        %d of %d\n", physical, router.Mapping().Physical())
+	fmt.Printf("  database owns   s%02d through s%02d\n", lo, hi)
 	return nil
 }
 
