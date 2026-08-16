@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
@@ -29,10 +30,11 @@ func NewWebhookHandler(
 	producer *messaging.Producer,
 	topics messaging.Topics,
 	dedup *Dedup,
+	meters *metrics.Metrics,
 	logger *slog.Logger,
 ) *WebhookHandler {
 	return &WebhookHandler{
-		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, logger: logger},
+		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, metrics: meters, logger: logger},
 		processor:  processor,
 	}
 }

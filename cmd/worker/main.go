@@ -20,6 +20,7 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
 	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/telemetry"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
@@ -108,19 +109,28 @@ func run() error {
 	}
 	producer := messaging.NewProducer(producerClient)
 
+	// The worker is the only process that calls providers in anger, so it is
+	// the only one whose provider latency and error classes mean anything.
+	meters := metrics.New()
+	serveObservability(ctx, cfg.Observability.WorkerMetricsAddr, meters, logger)
+
+	// Wrapped so every call is timed and every failure counted by class,
+	// without the service having to remember at five separate call sites.
 	providers := psp.NewRegistry(cfg.PSP.DefaultProvider,
-		simclient.New(simclient.Config{
-			Name: "psp-sync-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeSync, Timeout: cfg.PSP.Timeout,
-		}),
-		simclient.New(simclient.Config{
-			Name: "psp-async-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeAsync, Timeout: cfg.PSP.Timeout,
-		}),
-		simclient.New(simclient.Config{
-			Name: "psp-redirect-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeRedirect, Timeout: cfg.PSP.Timeout,
-		}),
+		psp.InstrumentAll(meters,
+			simclient.New(simclient.Config{
+				Name: "psp-sync-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeSync, Timeout: cfg.PSP.Timeout,
+			}),
+			simclient.New(simclient.Config{
+				Name: "psp-async-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeAsync, Timeout: cfg.PSP.Timeout,
+			}),
+			simclient.New(simclient.Config{
+				Name: "psp-redirect-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeRedirect, Timeout: cfg.PSP.Timeout,
+			}),
+		)...,
 	)
 
 	service := payment.NewService(shards, txstore.NewRepository(), providers, outbox.NewWriter(), topics, logger)
@@ -140,11 +150,11 @@ func run() error {
 	// One router across both kinds of work. They share the retry ladder and the
 	// dead letter queue, so a message is routed by the topic it originated on
 	// rather than by where it currently sits.
-	router := worker.NewRouter(db, producer, topics, dedup, logger)
+	router := worker.NewRouter(db, producer, topics, dedup, meters, logger)
 	router.Register(topics.Authorize,
-		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, logger).Handle)
+		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, meters, logger).Handle)
 	router.Register(topics.Webhook,
-		worker.NewWebhookHandler(db, processor, producer, topics, dedup, logger).Handle)
+		worker.NewWebhookHandler(db, processor, producer, topics, dedup, meters, logger).Handle)
 
 	// One consumer group across the work topics and every retry tier. A message
 	// on a retry tier is the same work, merely deferred, so it wants the same

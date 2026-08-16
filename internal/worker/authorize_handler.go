@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	"github.com/lequoctrung/payment-orchestrator/internal/resilience"
@@ -37,10 +38,11 @@ func NewAuthorizeHandler(
 	topics messaging.Topics,
 	dedup *Dedup,
 	breakers map[string]*resilience.CircuitBreaker,
+	meters *metrics.Metrics,
 	logger *slog.Logger,
 ) *AuthorizeHandler {
 	return &AuthorizeHandler{
-		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, logger: logger},
+		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, metrics: meters, logger: logger},
 		service:    service,
 		breakers:   breakers,
 	}
@@ -68,6 +70,11 @@ func (h *AuthorizeHandler) authorize(
 	payload AuthorizePayload,
 ) error {
 	breaker := h.breakerFor(payload.MerchantID)
+	// Published after every interaction below, and here too: a breaker that
+	// opened and then saw no further traffic would otherwise keep reporting the
+	// state it held before it tripped.
+	defer h.publishBreakerState(breaker)
+
 	if breaker != nil && !breaker.Allow() {
 		// The provider is already failing. Not calling it is a *known* outcome,
 		// never an ambiguous one, so this can be retried freely later.
@@ -145,6 +152,16 @@ func (h *AuthorizeHandler) handleProviderError(
 	// Authorize; reaching here means that reconciliation did not settle it, so
 	// the retry will begin by asking again rather than by charging again.
 	return h.scheduleRetry(ctx, msg, decision, authErr)
+}
+
+// publishBreakerState exports the breaker's position so an operator can see a
+// provider being cut off without reading logs. It is the only external evidence
+// that the breaker did anything at all.
+func (h *AuthorizeHandler) publishBreakerState(breaker *resilience.CircuitBreaker) {
+	if breaker == nil {
+		return
+	}
+	h.metrics.SetBreakerState(breaker.Name(), string(breaker.State()))
 }
 
 // breakerFor returns the breaker for the provider this work will use. Breakers

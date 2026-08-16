@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 )
@@ -25,6 +26,7 @@ type dispatcher struct {
 	producer *messaging.Producer
 	topics   messaging.Topics
 	dedup    *Dedup
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
@@ -57,6 +59,8 @@ func (d *dispatcher) scheduleRetry(
 	if !ok {
 		return d.sendToDLQ(ctx, msg, fmt.Sprintf("no retry tier for attempt %d: %v", tierIndex, cause))
 	}
+
+	d.metrics.RecordRetry(tier.Topic, nextAttempt)
 
 	d.logger.WarnContext(ctx, "scheduling retry",
 		slog.String("event_id", msg.EventID),
@@ -141,10 +145,11 @@ func NewRouter(
 	producer *messaging.Producer,
 	topics messaging.Topics,
 	dedup *Dedup,
+	meters *metrics.Metrics,
 	logger *slog.Logger,
 ) *Router {
 	return &Router{
-		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, logger: logger},
+		dispatcher: dispatcher{db: db, producer: producer, topics: topics, dedup: dedup, metrics: meters, logger: logger},
 		handlers:   make(map[string]messaging.Handler),
 	}
 }

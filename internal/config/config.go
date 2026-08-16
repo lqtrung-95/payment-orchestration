@@ -37,6 +37,12 @@ type Observability struct {
 	// worker's, or the lag gauge reports on a group nobody is consuming with.
 	ConsumerGroup string
 
+	// WorkerMetricsAddr is where the worker serves its own scrape endpoint. It
+	// is the only producer of provider latency, provider errors, retry ladder
+	// traffic, and breaker state, so without it those four are registered in a
+	// process nothing can read.
+	WorkerMetricsAddr string
+
 	// TracingEnabled is off by default. An OTLP exporter with no collector
 	// listening retries in the background forever, and a service that refuses
 	// to start because nothing is on port 4317 is worse than one with no traces.
@@ -224,11 +230,12 @@ func Load() (*Config, error) {
 		},
 
 		Observability: Observability{
-			CheckInterval:    l.duration("OBSERVABILITY_CHECK_INTERVAL", 5*time.Second),
-			ConsumerGroup:    l.str("KAFKA_CONSUMER_GROUP", "payment-workers"),
-			TracingEnabled:   l.bool("TRACING_ENABLED", false),
-			TracingEndpoint:  l.str("TRACING_ENDPOINT", "localhost:4317"),
-			TraceSampleRatio: l.float("TRACE_SAMPLE_RATIO", 1.0),
+			CheckInterval:     l.duration("OBSERVABILITY_CHECK_INTERVAL", 5*time.Second),
+			ConsumerGroup:     l.str("KAFKA_CONSUMER_GROUP", "payment-workers"),
+			WorkerMetricsAddr: l.str("WORKER_METRICS_ADDR", ":8081"),
+			TracingEnabled:    l.bool("TRACING_ENABLED", false),
+			TracingEndpoint:   l.str("TRACING_ENDPOINT", "localhost:4317"),
+			TraceSampleRatio:  l.float("TRACE_SAMPLE_RATIO", 1.0),
 		},
 	}
 

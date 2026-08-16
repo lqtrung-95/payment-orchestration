@@ -122,18 +122,20 @@ func run() error {
 	// nothing; the differences are what force real orchestration rather than a
 	// passthrough.
 	providers := psp.NewRegistry(cfg.PSP.DefaultProvider,
-		simclient.New(simclient.Config{
-			Name: "psp-sync-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeSync, Timeout: cfg.PSP.Timeout,
-		}),
-		simclient.New(simclient.Config{
-			Name: "psp-async-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeAsync, Timeout: cfg.PSP.Timeout,
-		}),
-		simclient.New(simclient.Config{
-			Name: "psp-redirect-sim", BaseURL: cfg.PSP.SimulatorURL,
-			Mode: simclient.ModeRedirect, Timeout: cfg.PSP.Timeout,
-		}),
+		psp.InstrumentAll(meters,
+			simclient.New(simclient.Config{
+				Name: "psp-sync-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeSync, Timeout: cfg.PSP.Timeout,
+			}),
+			simclient.New(simclient.Config{
+				Name: "psp-async-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeAsync, Timeout: cfg.PSP.Timeout,
+			}),
+			simclient.New(simclient.Config{
+				Name: "psp-redirect-sim", BaseURL: cfg.PSP.SimulatorURL,
+				Mode: simclient.ModeRedirect, Timeout: cfg.PSP.Timeout,
+			}),
+		)...,
 	)
 	if _, err := providers.Default(); err != nil {
 		return err

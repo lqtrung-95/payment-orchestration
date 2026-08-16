@@ -104,7 +104,7 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 	// event id against a unique index — a different mechanism for a different
 	// party, deliberately not sharing the merchant-facing one.
 	if deps.WebhookIngestor != nil {
-		webhooks := handler.NewWebhook(deps.WebhookIngestor, deps.Logger)
+		webhooks := handler.NewWebhook(deps.WebhookIngestor, deps.Metrics, deps.Logger)
 		h.POST("/webhooks/:provider", webhooks.Receive)
 	}
 

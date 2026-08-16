@@ -21,6 +21,7 @@ import (
 	domain "github.com/lequoctrung/payment-orchestrator/internal/domain/transaction"
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
 	"github.com/lequoctrung/payment-orchestrator/internal/outbox"
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp"
 	"github.com/lequoctrung/payment-orchestrator/internal/psp/simclient"
@@ -154,11 +155,16 @@ func newPipelineWith(t *testing.T, opts pipelineOpts) *pipeline {
 	dedup := worker.NewDedup(group)
 	processor := webhook.NewProcessor(db, registry, events, txstore.NewRepository(), logger)
 
-	msgRouter := worker.NewRouter(db, producer, topics, dedup, logger)
+	// A real metrics set rather than nil: the handlers record retries and
+	// breaker state unconditionally, and a nil here would turn a wiring mistake
+	// into a panic only under load.
+	meters := metrics.New()
+
+	msgRouter := worker.NewRouter(db, producer, topics, dedup, meters, logger)
 	msgRouter.Register(topics.Authorize,
-		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, logger).Handle)
+		worker.NewAuthorizeHandler(db, service, producer, topics, dedup, breakers, meters, logger).Handle)
 	msgRouter.Register(topics.Webhook,
-		worker.NewWebhookHandler(db, processor, producer, topics, dedup, logger).Handle)
+		worker.NewWebhookHandler(db, processor, producer, topics, dedup, meters, logger).Handle)
 
 	consumer, err := messaging.NewConsumer(brokers, group, "test-consumer-"+run, topics.Consumed(), logger)
 	if err != nil {

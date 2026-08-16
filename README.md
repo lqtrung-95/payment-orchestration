@@ -417,6 +417,13 @@ passes whether or not the customer was charged.
 **Rounding is unbiased** — zero drift across a thousand exact ties, which
 half-up fails.
 
+**The metrics endpoint cannot lie by omission** — a test walks the instrument
+set by reflection and fails if any declared metric is never written. Written
+because seven of them were not: an unwritten `CounterVec` has no children, so it
+produces no sample at all, and `psp_errors_total` was absent from a scrape
+rather than present and wrong. The first version of that test gathered the
+registry instead and passed against a deliberately unwired counter.
+
 **Money is conserved across databases** — 120 concurrent transfers between eight
 merchants split over two real Postgres databases. The total owed to merchants
 across both is unchanged to the cent, the suspense position is zero, no hold is
@@ -757,6 +764,8 @@ Stated plainly, because a README that omits them is not worth reading.
   per-partition consumers would change the ordering the retry ladder depends on.
 - **No outage, spike, or soak run.** Those k6 profiles exist and have never been
   executed, so nothing is claimed about failover timing or memory over hours.
+- **No Grafana dashboard.** The metrics are exported and correct; nothing
+  renders them. `make invariants` and `make provider-health` are the substitute.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
 - **`processed_events` and `webhook_events_raw` grow unbounded** — both need

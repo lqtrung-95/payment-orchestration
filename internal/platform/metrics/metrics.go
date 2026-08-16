@@ -56,10 +56,6 @@ type Metrics struct {
 	ConsumerLag      *prometheus.GaugeVec
 	CircuitBreaker   *prometheus.GaugeVec
 	WebhooksReceived *prometheus.CounterVec
-
-	// --- Reconciliation ----------------------------------------------------
-
-	ReconBreaks *prometheus.CounterVec
 }
 
 // New registers the instrument set against its own registry.
@@ -148,11 +144,6 @@ func New() *Metrics {
 			Name: "webhooks_received_total",
 			Help: "Provider callbacks by outcome — duplicates prove deduplication is firing.",
 		}, []string{"provider", "outcome"}),
-
-		ReconBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "recon_breaks_total",
-			Help: "Reconciliation breaks raised, by category.",
-		}, []string{"category"}),
 	}
 
 	r.MustRegister(
@@ -160,7 +151,7 @@ func New() *Metrics {
 		m.PaymentRequests, m.PaymentDuration,
 		m.PSPErrors, m.PSPCallDuration, m.DeclinedPayments,
 		m.RetryAttempts, m.DLQDepth, m.OutboxPending, m.ConsumerLag,
-		m.CircuitBreaker, m.WebhooksReceived, m.ReconBreaks,
+		m.CircuitBreaker, m.WebhooksReceived,
 	)
 
 	return m

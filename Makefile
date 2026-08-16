@@ -130,6 +130,13 @@ invariants: ## Show the must-be-zero counters and the queue depths
 	@curl -s http://localhost:8080/metrics \
 		| grep -E '^payment_(double_charges|lost_payments|ledger_imbalance|outbox_pending|dlq_depth) '
 
+WORKER_METRICS_URL ?= http://localhost:8081
+
+.PHONY: provider-health
+provider-health: ## Show provider error classes, declines, retries, and breaker state
+	@curl -s $(WORKER_METRICS_URL)/metrics \
+		| grep -E '^(psp_errors_total|payment_declines_total|payment_retry_attempts_total|psp_circuit_breaker_state)'
+
 # --- Demo ------------------------------------------------------------------
 
 .PHONY: demo

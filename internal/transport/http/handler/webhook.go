@@ -9,6 +9,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/common/utils"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
 
+	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
 )
 
@@ -22,11 +23,25 @@ import (
 // even when everything behind it is slow.
 type Webhook struct {
 	ingestor *webhook.Ingestor
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
-func NewWebhook(ingestor *webhook.Ingestor, logger *slog.Logger) *Webhook {
-	return &Webhook{ingestor: ingestor, logger: logger}
+func NewWebhook(ingestor *webhook.Ingestor, meters *metrics.Metrics, logger *slog.Logger) *Webhook {
+	return &Webhook{ingestor: ingestor, metrics: meters, logger: logger}
+}
+
+// recordOutcome counts a delivery by what became of it.
+//
+// Counted here rather than inside the ingestor because this is the only place
+// that sees every outcome, including the ones rejected before anything is
+// written. A `rejected` count that stays flat while `accepted` climbs is the
+// signature of a healthy endpoint; the reverse is someone probing it.
+func (h *Webhook) recordOutcome(provider, outcome string) {
+	if h.metrics == nil {
+		return
+	}
+	h.metrics.RecordWebhook(provider, outcome)
 }
 
 // Receive handles POST /webhooks/:provider.
@@ -41,11 +56,13 @@ func (h *Webhook) Receive(ctx context.Context, c *app.RequestContext) {
 
 	result, err := h.ingestor.Ingest(ctx, provider, headers, body)
 	if err != nil {
+		h.recordOutcome(provider, "rejected")
 		h.respondToIngestError(ctx, c, provider, err)
 		return
 	}
 
 	if result.Duplicate {
+		h.recordOutcome(provider, "duplicate")
 		// 200, not a 409. A duplicate is the provider doing its job — retrying a
 		// delivery it believes failed — and answering with an error makes it
 		// retry harder, turning its redelivery into a flood.
@@ -55,6 +72,7 @@ func (h *Webhook) Receive(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	h.recordOutcome(provider, "accepted")
 	c.JSON(consts.StatusOK, utils.H{"status": "received"})
 }
 

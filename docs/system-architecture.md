@@ -416,6 +416,13 @@ migration, an admin session, or a repair script.
 | Concurrent captures cannot both win | Optimistic locking on `version` |
 | Concurrent spends cannot overdraw | `pg_advisory_xact_lock` on merchant and currency |
 
+The worker exports its own scrape endpoint (`WORKER_METRICS_ADDR`, `:8081` by
+default). It is the only process that calls providers in anger, so provider
+latency, provider error classes, retry ladder traffic, and circuit breaker state
+have no other producer — and the API process registers the same names, so
+without the worker's endpoint a dashboard would show a provider that never errs
+while the worker fails every call.
+
 On top of those, three gauges are computed continuously from committed state and
 must read zero: `payment_ledger_imbalance`, `payment_double_charges`,
 `payment_lost_payments`. They are queried on every shard and summed, and the
