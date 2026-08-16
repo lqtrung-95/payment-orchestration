@@ -49,9 +49,6 @@ const (
 	StateCancelled  State = "cancelled"
 )
 
-// Resolved reports whether the transfer has reached a terminal state.
-func (s State) Resolved() bool { return s == StateConfirmed || s == StateCancelled }
-
 // PastCommitPoint reports whether every participant has reserved. A transfer
 // past this point is owed completion: cancelling it would release a hold the
 // other side has already been promised.

@@ -699,6 +699,10 @@ together — the guarantee is lost the moment they can be split. The shard route
 sits above them and has no method that spans two databases, so the split cannot
 be introduced by accident either.
 
+[`docs/system-architecture.md`](docs/system-architecture.md) has the component,
+sequence, and state diagrams, the table of which data lives on which shard, and
+the list of where every invariant is actually enforced.
+
 ## Design decisions
 
 Written when the decision was made, not reconstructed afterwards. Each records

@@ -60,7 +60,6 @@ func (m Money) Currency() Currency { return m.currency }
 
 func (m Money) IsZero() bool     { return m.amount == 0 }
 func (m Money) IsPositive() bool { return m.amount > 0 }
-func (m Money) IsNegative() bool { return m.amount < 0 }
 
 // IsValid reports whether this Money carries a usable currency. A zero-value
 // Money read from an uninitialised struct field is not valid.
