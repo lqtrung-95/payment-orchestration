@@ -10,7 +10,7 @@ times, out of order, before the API call that created the transaction returned.
 A settlement file that disagrees with your ledger by three cents. The happy path
 is a CRUD app; the failure paths are the actual problem.
 
-> **Status: in progress — 6 of 10 phases complete.**
+> **Status: in progress — 7 of 10 phases complete.**
 > Built and tested: ledger, state machine, idempotency, provider abstraction, a
 > provider simulator that fails on purpose, an asynchronous pipeline —
 > transactional outbox, Kafka, error-aware retries, DLQ — and webhook ingestion
@@ -18,7 +18,8 @@ is a CRUD app; the failure paths are the actual problem.
 > double-entry ledger, and settlement reconciliation with an eight-category
 > break taxonomy.
 > Metrics, distributed tracing, a continuous invariant checker, and measured
-> load numbers are in. Sharding is not built.
+> load numbers are in. Merchants are routed to physical databases by shard key,
+> and money crosses between them with try-confirm-cancel.
 > Everything claimed below is verified by tests in this repo — see
 > [Verified behaviour](#verified-behaviour). Nothing here is aspirational; the
 > roadmap is kept separate, at the bottom.
@@ -171,6 +172,90 @@ The raw payload is stored as **bytes, not JSONB**: the signature was computed
 over those exact bytes, and normalising them means the stored event can never be
 verified again. `webhookctl replay` re-reads the log and reports what would
 change; a healthy log changes nothing.
+
+### Merchants live on different databases
+
+Sixty-four logical shards, derived from the merchant and stored on every row.
+The number of *physical* databases behind those 64 slots is configuration.
+
+The physical count is constrained to a power of two that divides 64, and that
+constraint is the whole point. Doubling it splits every existing range exactly
+in half, so growing capacity is *"copy logical shards 32–63 to the new
+database"* — a contiguous bulk move, verifiable by counting rows per shard key,
+that leaves the other half untouched. Hashing merchants straight onto databases
+would make adding one a rehash of the entire data set, taken while money is
+moving.
+
+Routing reads the **stored** key, never re-derives it. Re-deriving means a
+change to the hash function silently sends reads to a database that does not
+hold the rows.
+
+Three consequences, all deliberate:
+
+- **There is no lookup by payment id alone.** `Authorize` takes the merchant
+  explicitly. Finding a payment from its id would mean querying all 64 shards,
+  which makes every read as expensive as the largest deployment. This is the
+  cost sharding actually imposes, paid at the API boundary rather than hidden
+  behind a fan-out.
+- **One outbox relay per shard.** The outbox row is written in the same
+  transaction as the payment, so it lives where the payment lives. A single
+  relay would leave every other database's events unpublished — payments
+  accepted and never acted on.
+- **The invariant checker sums across shards.** One that read only shard 0 would
+  report zero while another database was unbalanced.
+
+The webhook log, the consumer dedup index, and the transfer coordinator's own
+state stay on shard 0, because none of them has a merchant to partition on: a
+webhook arrives before any payment has been resolved from it, and an event id
+carries no merchant at all.
+
+Unset configuration means one database holding all 64 logical shards —
+identical behaviour to before any of this existed.
+
+### Moving money between two databases
+
+Postgres cannot commit across databases. A transfer between merchants on
+different shards therefore has no transaction available to it, and the
+alternatives are worse than they look: two independent commits lose money when
+the second one crashes, two-phase commit blocks until a human intervenes, and a
+saga compensates a completed transfer with a reverse transfer — which is not an
+inverse, because the funds were spendable in between.
+
+So it runs as **try-confirm-cancel**:
+
+```
+try      reserve funds on both shards — nothing posted, balance unchanged
+         ── commit point: durable before either side posts ──
+confirm  post a balanced entry on each shard, release the holds
+cancel   release the holds; there is nothing to undo
+```
+
+**The commit point is the entire design.** Before it, the transfer may be
+cancelled freely. After it, every participant has already agreed and the
+transfer is *owed* completion — a failing confirm is retried, never converted
+into a cancel. That one rule is what lets a sweeper look at a transfer whose
+coordinator died and know what to do without asking anyone.
+
+Each shard posts a balanced entry against a **suspense account**:
+
+```
+source shard:       Dr merchant payable    Cr transfer suspense
+destination shard:  Dr transfer suspense   Cr merchant payable
+```
+
+Each entry balances inside its own database, which it must — the balance trigger
+is per-entry and the databases share nothing. Across shards the suspense legs
+are equal and opposite, so **the system-wide suspense position is zero whenever
+nothing is in flight**, and a non-zero total is precisely the signal that one
+half completed and the other did not. Between the two confirms it is
+legitimately non-zero; that window is what a distributed transfer honestly is.
+
+Available balance subtracts outstanding holds, under a transaction-scoped
+advisory lock on the merchant and currency. Without the lock, two transfers of
+600 against a balance of 1,000 both read the same figure before either inserts,
+and both pass a check that was correct when it ran. Removing it and re-running
+the concurrency test overdraws the account to −200 — which is how the lock was
+confirmed to matter rather than assumed to.
 
 ### Settlement reconciliation
 
@@ -332,6 +417,22 @@ passes whether or not the customer was charged.
 **Rounding is unbiased** — zero drift across a thousand exact ties, which
 half-up fails.
 
+**Money is conserved across databases** — 120 concurrent transfers between eight
+merchants split over two real Postgres databases. The total owed to merchants
+across both is unchanged to the cent, the suspense position is zero, no hold is
+left outstanding, and no merchant is overdrawn. Deleting either half of the
+confirm shows up in all three assertions at once.
+
+**A killed coordinator strands nothing** — a transfer abandoned *before* the
+commit point has its holds released and the funds become spendable again; one
+abandoned *after* it is completed by the sweeper, with the destination credited
+and suspense returned to zero. Sweeping a finished transfer three more times
+posts nothing further.
+
+**Routing is physical, not filtered** — a merchant's payment, its audit rows,
+and its outbox row are present in one database and *absent* from the other.
+Verified against two databases created and migrated by the test itself.
+
 **Correctness under load** — across **164,933 payments** created by k6 against
 the live stack: zero ledger imbalance, zero double charges, zero lost payments.
 Four requests failed, all `statement timeout` on the idempotency claim while the
@@ -340,9 +441,6 @@ state. The invariant checker runs *during* the load, because a run that reports
 throughput while the ledger is quietly unbalanced is a failed run that looks
 like a passing one. It is itself tested against seeded violations: a checker
 that always returned zero would pass every load test ever run against it.
-
-No throughput figure accompanies this, on purpose —
-[`docs/benchmarks/`](docs/benchmarks/) explains why.
 
 **Under load, with the provider failing ~30% of requests** — measured, not
 projected; hardware and commands in [`docs/benchmarks/`](docs/benchmarks/README.md):
@@ -503,6 +601,29 @@ before the API response. Every delivery is answered 200, and the payment reaches
 make replay        # re-evaluates every stored event; a healthy log changes nothing
 ```
 
+To run it sharded, create a second database and point the service at both. The
+migration runner applies to every shard listed, and reports all failures
+together:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec postgres createdb -U payment payment_shard1
+```
+
+Then set `POSTGRES_SHARD_DSNS` to both DSNs (the commented example in
+`.env.example` is exactly this) and run `make migrate-up`. The service logs
+`physical_shards=2` at boot and starts one outbox relay per shard; payments for
+different merchants now land in different databases.
+
+Move money between two of them:
+
+```bash
+go run ./cmd/transferctl send -from merchant-a -to merchant-b -amount 12500 -key demo-1
+```
+
+The output states which database each side resolved to and whether the transfer
+actually crossed. `make transfers` lists anything still in flight, and
+`make sweep` resolves transfers whose coordinator stopped.
+
 ```bash
 make test          # includes integration tests against the live stack
 make check         # fmt, vet, lint, test
@@ -515,11 +636,12 @@ flowchart TB
     Client -->|Idempotency-Key| MW[Idempotency middleware]
     MW --> H[Payment handler]
     H --> S[Payment service]
-    S -->|one transaction| TX[(payment_transactions)]
-    S -->|one transaction| AUD[(transaction_state_changes)]
-    S -->|one transaction| OB[(outbox)]
+    S -->|routed by shard key| SH{Shard router}
+    SH -->|one transaction| TX[(payment_transactions)]
+    SH -->|one transaction| AUD[(transaction_state_changes)]
+    SH -->|one transaction| OB[(outbox)]
 
-    OB --> REL[Outbox relay]
+    OB --> REL[Outbox relay - one per shard]
     REL -->|key = merchant| K[Kafka]
     K --> W[Worker]
     W --> PSP[PSP adapters and fault simulator]
@@ -533,24 +655,24 @@ flowchart TB
     WH -->|key = charge reference| OB
     W -->|guarded by sequence and matrix| TX
 
-    subgraph planned [Not built yet]
-        REC[FX and reconciliation]
-    end
+    LG --> REC[Settlement reconciliation]
+    SF[(settlement files)] --> REC
+    REC -->|adjustments| LG
 
-    LG -.-> REC
+    TCC[Transfer coordinator] -->|try / confirm / cancel| SH
+    SW[Sweeper] --> TCC
 ```
 
-Solid edges exist today. The boxed subgraph and the dotted edge into it do not.
-
-The transaction, its audit row, and the queue message are written in **one**
-database transaction — that atomicity is what makes queued work neither lost nor
-invented. Postings begin at capture, which has no HTTP surface yet.
+Everything drawn exists. The transaction, its audit row, and the queue message
+are written in **one** database transaction, on the database the merchant hashes
+to — that atomicity is what makes queued work neither lost nor invented, and it
+is why the outbox relay runs once per shard. Postings begin at capture.
 
 One service with enforced module boundaries, deliberately not microservices — a
 distributed monolith would be a worse design, not a better one, at this size.
 
 ```
-cmd/          orchestrator, worker, migrate, pspsim, dlqctl, webhookctl, reconctl
+cmd/          orchestrator, worker, migrate, pspsim, dlqctl, webhookctl, reconctl, transferctl
 internal/
   domain/     money, ledger, transaction   — no I/O, no framework types
   store/      repositories                  — take a Querier, so callers own the tx boundary
@@ -561,18 +683,21 @@ internal/
   fx/         fixed-point rates, locks, conversion  (domain/fx)
   invariant/  continuous must-be-zero checks, queue depth and consumer lag
   recon/      settlement parsing, matching, the break taxonomy, resolution
+  tcc/        cross-shard transfers: coordinator, participants, sweeper
   webhook/    ingest, per-provider verifiers, guarded processor, replay
   worker/     queue handlers, router, dedup
   resilience/ backoff with full jitter, circuit breaker
   service/    orchestration
   transport/  Hertz handlers + middleware
-  platform/   postgres, redis, kafka, telemetry, sharding
+  platform/   postgres (pools + shard router), redis, kafka, telemetry, sharding
 migrations/   embedded in the binary
 ```
 
 Repositories accept a `Querier` satisfied by both a pool and a transaction. That
-is what will let the transactional outbox commit a domain write and an outbox
-write together — the guarantee is lost the moment they can be split.
+is what lets the transactional outbox commit a domain write and an outbox write
+together — the guarantee is lost the moment they can be split. The shard router
+sits above them and has no method that spans two databases, so the split cannot
+be introduced by accident either.
 
 ## Design decisions
 
@@ -588,6 +713,7 @@ the alternatives that were seriously considered and rejected.
 - [0007 — Transactional outbox and error-aware retries](docs/adr/0007-transactional-outbox-and-error-aware-retries.md)
 - [0008 — Webhook ingestion, deduplication, and ordering](docs/adr/0008-webhook-ingestion-and-ordering.md)
 - [0009 — FX, capture postings, and settlement reconciliation](docs/adr/0009-fx-capture-postings-and-reconciliation.md)
+- [0010 — Physical sharding and cross-shard transfers](docs/adr/0010-physical-sharding-and-cross-shard-transfers.md)
 
 ## Known gaps
 
@@ -605,23 +731,22 @@ Stated plainly, because a README that omits them is not worth reading.
   settling. The remaining half of the cross-currency picture.
 - **Reconciliation is unbenchmarked.** It loads a file and its ledger window
   into memory, which suits demo scale; the 100k-row target is unmeasured.
-- **Sharding is decided, not implemented.** The key is derived and stored on
-  every row; routing across physical databases comes later. Storing it now is
-  the point — backfilling a shard key across a populated ledger means rewriting
-  every row while the service stays online.
-- **Still no throughput number.** Load testing is built and run
-  ([`loadtest/`](loadtest/), [`docs/benchmarks/`](docs/benchmarks/)), but the
-  only machine available was at a load average of 46 on 10 cores and repeated
-  runs of the same profile varied between 33 and 428 requests/second. That
-  spread measures a laptop, not this system, so no figure is published. What
-  *was* measured is recorded — including 164,933 payments created with zero
-  invariant violations.
+- **No resharding tooling.** The mapping supports growth and the move is a
+  contiguous bulk copy by construction, but nothing automates copying rows
+  between databases or coordinating the cutover.
+- **No hot-key cache.** Balances are derived from postings on every read, which
+  is correct and unoptimised. A cached balance with explicit invalidation was
+  planned and cut.
+- **Processing does not scale horizontally; ingestion does.** The worker
+  consumes with a single goroutine making synchronous provider calls, so the
+  drain rate is roughly the reciprocal of provider latency however many
+  partitions exist. Measured and documented in
+  [`docs/benchmarks/`](docs/benchmarks/) rather than fixed: concurrent
+  per-partition consumers would change the ordering the retry ladder depends on.
+- **No outage, spike, or soak run.** Those k6 profiles exist and have never been
+  executed, so nothing is claimed about failover timing or memory over hours.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
-- **Tracing is not built.** Metrics and the invariant checker are; a single
-  trace spanning API → Kafka → provider → webhook → ledger is not, so
-  correlating one payment across the pipeline still means grepping by
-  request id.
 - **`processed_events` and `webhook_events_raw` grow unbounded** — both need
   pruning, and the raw payloads may carry PII, so that one also needs a
   retention window and encryption at rest.
@@ -644,8 +769,8 @@ Stated plainly, because a README that omits them is not worth reading.
 | 05 | Webhook ingest, dedup, out-of-order tolerance | Done |
 | 06 | Payment instrument binding + lifecycle | Skipped |
 | 07 | FX conversion + settlement reconciliation | Done |
-| 08 | Sharding + cross-shard transactions (TCC) | |
-| 09 | Metrics, invariant checker, load + chaos testing | Partly done |
+| 08 | Sharding + cross-shard transactions (TCC) | Partly done |
+| 09 | Metrics, tracing, invariant checker, load + chaos testing | Partly done |
 | 10 | Architecture docs and demo | |
 
 Phases 01–05 are the shippable core: a payment can be created, authorized
