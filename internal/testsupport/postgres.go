@@ -76,6 +76,8 @@ func Truncate(t *testing.T, db *postgres.DB) {
 
 	const query = `
 		TRUNCATE
+			tcc_reservations,
+			tcc_transfers,
 			recon_breaks,
 			recon_runs,
 			settlement_rows,

@@ -62,6 +62,7 @@ build: ## Build binaries into bin/
 	go build -o $(BIN_DIR)/dlqctl ./cmd/dlqctl
 	go build -o $(BIN_DIR)/webhookctl ./cmd/webhookctl
 	go build -o $(BIN_DIR)/reconctl ./cmd/reconctl
+	go build -o $(BIN_DIR)/transferctl ./cmd/transferctl
 
 .PHONY: run
 run: ## Run the orchestrator against the local stack
@@ -98,6 +99,14 @@ breaks: ## List open reconciliation breaks
 .PHONY: charges
 charges: ## Show what the simulated provider believes it charged
 	@curl -s $(PSPSIM_URL)/admin/charges | jq '{count, charges: [.charges[] | {reference, status, amount_minor}]}'
+
+.PHONY: transfers
+transfers: ## List cross-shard transfers that have not resolved
+	go run ./cmd/transferctl pending
+
+.PHONY: sweep
+sweep: ## Resolve transfers whose coordinator stopped
+	go run ./cmd/transferctl sweep
 
 # --- Load testing ----------------------------------------------------------
 

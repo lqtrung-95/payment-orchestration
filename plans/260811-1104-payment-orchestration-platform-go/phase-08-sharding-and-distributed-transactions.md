@@ -1,6 +1,6 @@
 # Phase 08 — Sharding + Distributed Transactions (TCC)
 
-**Priority:** P1 — the system-design interview phase · **Status:** Not started · **Week:** 11
+**Priority:** P1 — the system-design interview phase · **Status:** Partially complete · **Week:** 11
 
 The JD asks for "large-scale distributed system design" and "in-depth understanding of distributed, cache, message... mechanisms." This phase is what lets you answer the sharding and consistency questions from experience rather than from a book.
 
@@ -81,17 +81,17 @@ A coordinator drives the state machine; a timeout sweeper cancels stranded `Try`
 
 ## Todo
 
-- [ ] Shard resolver + physical mapping
-- [ ] Shard-aware repositories
-- [ ] Multi-shard migration runner
-- [ ] TCC coordinator + participants
-- [ ] Idempotent Try/Confirm/Cancel
-- [ ] Reservation timeout sweeper
-- [ ] Advisory locks (same-shard)
-- [ ] Redis lease + fencing (cross-shard)
-- [ ] Balance snapshots + cache invalidation
-- [ ] Conservation-of-money concurrency tests
-- [ ] ADRs
+- [x] Shard resolver + physical mapping
+- [x] Shard-aware repositories (payment write path; back-office stays on shard 0)
+- [x] Multi-shard migration runner
+- [x] TCC coordinator + participants
+- [x] Idempotent Try/Confirm/Cancel
+- [x] Reservation timeout sweeper
+- [x] Advisory locks (same-shard)
+- [ ] Redis lease + fencing (cross-shard) — not needed: every participant's work is single-shard by construction
+- [ ] Balance snapshots + cache invalidation — cut, see ADR 0010
+- [x] Conservation-of-money concurrency tests
+- [x] ADR 0010
 
 ## Success criteria
 

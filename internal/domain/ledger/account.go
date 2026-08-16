@@ -67,6 +67,16 @@ const (
 	PurposeFeeRevenue Purpose = "fee_revenue"  // revenue: our fee
 	PurposeFXGainLoss Purpose = "fx_gain_loss" // revenue: rate movement between auth and settlement
 	PurposeSettlement Purpose = "settlement"   // asset: funds received into our bank
+
+	// PurposeTransferSuspense is the holding account for money in flight
+	// between shards. A cross-shard transfer writes a balanced entry on each
+	// database — the source pays into suspense, the destination pays out of it
+	// — because each entry must balance within the database that holds it.
+	//
+	// The suspense balances therefore net to zero across all shards once no
+	// transfer is mid-flight, and a non-zero total is exactly the signal that
+	// one side of a transfer completed and the other did not.
+	PurposeTransferSuspense Purpose = "transfer_suspense" // liability: money in flight between shards
 )
 
 type Account struct {

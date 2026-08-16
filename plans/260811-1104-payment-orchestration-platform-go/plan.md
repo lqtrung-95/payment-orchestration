@@ -29,7 +29,7 @@ CloudWeGo is ByteDance's own open-source Go stack — using it is a deliberate s
 | 05 | [Webhook ingestion + dedup](phase-05-webhook-ingestion-and-dedup.md) | 8 | **Complete** |
 | 06 | [Payment instrument lifecycle](phase-06-payment-instrument-lifecycle.md) | 9 | Skipped — not a dependency for 07 |
 | 07 | [FX + reconciliation](phase-07-fx-and-reconciliation.md) | 10 | **Complete** |
-| 08 | [Sharding + distributed transactions](phase-08-sharding-and-distributed-transactions.md) | 11 | Not started |
+| 08 | [Sharding + distributed transactions](phase-08-sharding-and-distributed-transactions.md) | 11 | **Partially complete** — routing, TCC, advisory locks; no resharding tooling or balance cache |
 | 09 | [Observability + load/chaos testing](phase-09-observability-and-load-chaos-testing.md) | 12 | **Partially complete** — metrics, tracing, invariants, benchmarks |
 | 10 | [Docs, ADRs, demo, resume assets](phase-10-docs-adrs-demo-and-resume-assets.md) | 12 | Not started |
 

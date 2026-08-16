@@ -27,11 +27,17 @@ import (
 	"github.com/lequoctrung/payment-orchestrator/internal/service/payment"
 	"github.com/lequoctrung/payment-orchestrator/internal/store/idempotency"
 	txstore "github.com/lequoctrung/payment-orchestrator/internal/store/transaction"
+	"github.com/lequoctrung/payment-orchestrator/internal/tcc"
 	transport "github.com/lequoctrung/payment-orchestrator/internal/transport/http"
 	"github.com/lequoctrung/payment-orchestrator/internal/transport/http/handler"
 	"github.com/lequoctrung/payment-orchestrator/internal/webhook"
 	webhookproviders "github.com/lequoctrung/payment-orchestrator/internal/webhook/providers"
 )
+
+// transferSweepBatch bounds how many stranded transfers one pass resolves, so
+// a backlog is shared between instances rather than monopolised by whichever
+// one ticks first.
+const transferSweepBatch = 50
 
 func main() {
 	if err := run(); err != nil {
@@ -196,6 +202,18 @@ func run() error {
 	go func() {
 		if err := checker.Run(ctx, cfg.Observability.CheckInterval); err != nil {
 			logger.ErrorContext(ctx, "invariant checker stopped", slog.Any("error", err))
+		}
+	}()
+
+	// Reservations are unspendable funds. A coordinator that dies between try
+	// and confirm freezes a merchant's balance with no expiry and no owner, so
+	// the sweeper is a money-safety control rather than a background job — it
+	// runs wherever the service runs.
+	transfers := tcc.NewCoordinator(router, tcc.DefaultConfig(), logger)
+	sweeper := tcc.NewSweeper(transfers, transferSweepBatch, logger)
+	go func() {
+		if err := sweeper.Run(ctx, cfg.Observability.CheckInterval); err != nil {
+			logger.ErrorContext(ctx, "transfer sweeper stopped", slog.Any("error", err))
 		}
 	}()
 
