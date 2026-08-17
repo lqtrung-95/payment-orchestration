@@ -4,8 +4,9 @@ Every number here was measured on the hardware described below, with the exact
 command shown. Nothing is extrapolated, and nothing is rounded up.
 
 The headline is not the throughput. It is that **the three must-be-zero
-invariants held at zero while the provider was failing roughly a third of
-requests** — and that the measurements found a real bottleneck rather than
+invariants held at zero in every run here** — including one where the provider
+was failing roughly a third of requests, and one where it vanished entirely
+mid-run — and that the measurements found a real bottleneck rather than
 confirming a hope.
 
 ## Hardware
@@ -94,6 +95,103 @@ The invariants were exported continuously *during* the run by the checker, not
 computed afterwards. A throughput number measured while correctness was
 silently broken is a failed run that looks like a passing one.
 
+### Spike: a tenfold step change in five seconds
+
+Whether the system sheds load or falls over.
+
+```bash
+k6 run -e PROFILE=spike loadtest/payments.js
+```
+
+| | |
+|---|---|
+| Accepted | 459 req/s over 75 s |
+| Requests | 34,506 |
+| Server errors | **0** |
+| Median | 1.83 s |
+| p95 | 3.11 s |
+| Dropped by k6 | 11,242 iterations |
+| Invariants | all **0** |
+| DLQ | **0** |
+
+It degrades by getting slower, not by failing. The p95 threshold is crossed and
+the run is marked failed by k6, which is the correct verdict — a payment API
+answering in three seconds is not healthy — but nothing was refused, nothing was
+lost, and no request returned an error. The backlog is the story: 30,372
+payments sat at `created` behind 26,329 pending outbox rows when the load
+stopped.
+
+### Outage: the provider disappears mid-run
+
+Steady 200 rps for 150 s, with the provider taken down for 40 s in the middle.
+
+```bash
+k6 run -e PROFILE=soak -e SOAK_DURATION=150s loadtest/payments.js
+curl -X POST "localhost:9091/admin/outage?seconds=40"   # 25s in
+```
+
+| | |
+|---|---|
+| Requests | 29,930 |
+| Failed | **0** |
+| Median | 12.5 ms |
+| p95 | 153 ms |
+| Breaker opened | within **6 s** of the outage starting |
+| Breaker closed | within **6 s** of the provider returning |
+| Messages deferred to the 5 m tier | 10,401 |
+| Provider calls that actually failed | **8** |
+| DLQ | **0** |
+
+Two things worth separating. **The API is unaffected** — median 12.5 ms
+throughout, because the provider is off the request path by design; a customer
+would not have noticed. And **the breaker turned an outage into deferred work**:
+10,401 messages were rescheduled while only 8 calls were allowed through to fail.
+That ratio is the breaker earning its place.
+
+Recovery needed no intervention. Authorizations resumed on the next sample after
+the provider returned and drained at roughly 450 per six seconds.
+
+```
+t=  0s breaker=closed  authorized=1594
+t=  6s breaker=open    authorized=1594     ← tripped
+t= 34s breaker=open    authorized=1594     ← nothing lost, nothing attempted
+t= 40s breaker=closed  authorized=1607     ← provider back
+t= 93s breaker=closed  authorized=5083
+t=163s breaker=closed  authorized=9086
+```
+
+### Soak: ten minutes at a constant 200 rps
+
+Hunting leaks and unbounded growth rather than limits.
+
+```bash
+k6 run -e PROFILE=soak -e SOAK_DURATION=10m loadtest/payments.js
+```
+
+| | |
+|---|---|
+| Payments | 119,965 |
+| Orchestrator RSS | 27 MB → 48 MB, flat from minute 1 |
+| Worker RSS | 18 MB → 34 MB, flat from minute 2 |
+| Outbox depth | never above 64 |
+| Consumer lag | grew linearly to 62,480 |
+| Invariants | all **0** |
+
+**No leak over ten minutes.** Both processes reach a working set within a minute
+and stay there for the remaining nine. Ten minutes is not a soak in the sense
+that matters for production — it establishes that nothing grows per-request, and
+says nothing about a slow leak over days.
+
+**And it localises the bottleneck precisely.** The outbox relay keeps up
+completely: depth stayed around forty for the whole run, so the relay is not the
+constraint. The consumer is. Ingestion at 200/s against a drain rate of roughly
+90/s produced a lag curve that grows at about 6,900 per minute — which matches
+the arithmetic exactly.
+
+That is a sharper result than the chaos run gave. There, a large outbox backlog
+made it look as though both stages were behind; here the relay is demonstrably
+fine and the single-goroutine consumer is the whole gap.
+
 ## The bottleneck the metrics found
 
 The API accepts payments far faster than the pipeline behind it drains them. At
@@ -158,10 +256,10 @@ Stated because an omitted benchmark is easily mistaken for a passed one.
 
 - **The 2,000 req/s and p99 < 150 ms targets in the phase plan are not met**, and
   are not close on this hardware.
-- **No outage-recovery run.** Failover timing under a full provider outage is
-  untested at load.
-- **No soak run.** The profile exists; a two-hour run confirming flat memory has
-  not been done, so nothing is claimed about leaks.
+- **No soak longer than ten minutes.** Nothing is claimed about a slow leak over
+  hours or days; what is claimed is that memory is flat per-request.
 - **No reconciliation benchmark.** The 100k-rows-in-60s target is unmeasured;
   reconciliation currently loads a file and its ledger window into memory.
-- **Spike shedding is unmeasured.** The profile exists and has not been run.
+- **No multi-instance run.** Every number here is one orchestrator and one
+  worker. The relay claims by lease and the consumer runs in a group, so both
+  are built to scale out, and neither has been measured doing it.

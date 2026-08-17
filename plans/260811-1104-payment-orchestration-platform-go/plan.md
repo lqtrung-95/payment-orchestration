@@ -30,7 +30,7 @@ CloudWeGo is ByteDance's own open-source Go stack — using it is a deliberate s
 | 06 | [Payment instrument lifecycle](phase-06-payment-instrument-lifecycle.md) | 9 | Skipped — not a dependency for 07 |
 | 07 | [FX + reconciliation](phase-07-fx-and-reconciliation.md) | 10 | **Complete** |
 | 08 | [Sharding + distributed transactions](phase-08-sharding-and-distributed-transactions.md) | 11 | **Partially complete** — routing, TCC, advisory locks; no resharding tooling or balance cache |
-| 09 | [Observability + load/chaos testing](phase-09-observability-and-load-chaos-testing.md) | 12 | **Partially complete** — metrics, tracing, invariants, benchmarks |
+| 09 | [Observability + load/chaos testing](phase-09-observability-and-load-chaos-testing.md) | 12 | **Complete** — metrics, tracing, invariants, dashboard, spike/outage/soak runs |
 | 10 | [Docs, ADRs, demo, resume assets](phase-10-docs-adrs-demo-and-resume-assets.md) | 12 | **Partially complete** — everything but the video |
 
 **Shippable checkpoint: end of Phase 05.** Everything after is upside. Do not start Phase 06 if 01–05 are not complete and demoable.

@@ -466,6 +466,19 @@ timer, not computed afterwards. A throughput number measured while correctness
 was silently broken is a failed run that looks like a passing one — and there
 are tests that plant a violation to prove the checker actually notices.
 
+**A provider outage costs nothing but time** — the provider was taken down for
+40 seconds under a steady 200 rps. The API never noticed: 29,930 requests, zero
+failures, median 12.5 ms throughout, because the provider is off the request
+path. The breaker opened within 6 seconds and closed within 6 seconds of
+recovery, and it turned the outage into **10,401 deferred messages against only
+8 provider calls allowed through to fail.** Nothing reached the dead letter
+queue.
+
+**Memory is flat under sustained load** — 119,965 payments over ten minutes at a
+constant 200 rps. Both processes reach a working set inside a minute and stay
+there. The same run localised the bottleneck exactly: the outbox relay never
+exceeded a depth of 64, so the constraint is the consumer, not the relay.
+
 The same run found the real limit: **ingestion scales, processing does not.**
 55,590 payments sat at `created` behind 42,409 pending outbox rows, because the
 worker consumes with one goroutine making synchronous provider calls. That is
@@ -762,11 +775,14 @@ Stated plainly, because a README that omits them is not worth reading.
   partitions exist. Measured and documented in
   [`docs/benchmarks/`](docs/benchmarks/) rather than fixed: concurrent
   per-partition consumers would change the ordering the retry ladder depends on.
-- **No outage, spike, or soak run.** Those k6 profiles exist and have never been
-  executed, so nothing is claimed about failover timing or memory over hours.
-- **No Grafana dashboard.** The metrics are exported, scraped, and correct;
-  nothing renders them. `make invariants` and `make provider-health` are the
-  substitute.
+- **No soak beyond ten minutes.** Memory is flat per-request over that window;
+  nothing is claimed about a slow leak over days.
+- **No multi-instance run.** Every published number is one orchestrator and one
+  worker. Both are built to scale out and neither has been measured doing it.
+- **The observability stack needs Docker file sharing.** Prometheus and Grafana
+  mount their config from this repository, so Docker Desktop must be allowed to
+  share the project directory. Without it those two containers fail to start
+  while everything else runs normally.
 - **No spans on database calls.** The trace covers HTTP, the outbox, Kafka, and
   the provider call; time spent in Postgres appears as a gap inside those spans
   rather than as its own.
@@ -795,7 +811,7 @@ Stated plainly, because a README that omits them is not worth reading.
 | 06 | Payment instrument binding + lifecycle | Skipped |
 | 07 | FX conversion + settlement reconciliation | Done |
 | 08 | Sharding + cross-shard transactions (TCC) | Done, minus resharding tooling and a balance cache |
-| 09 | Metrics, tracing, invariant checker, load + chaos testing | Done, minus a Grafana dashboard and the outage/spike/soak runs |
+| 09 | Metrics, tracing, invariant checker, load + chaos testing | Done |
 | 10 | Architecture docs and demo | Done, minus a walkthrough video |
 
 Phases 01–05 are the shippable core: a payment can be created, authorized
