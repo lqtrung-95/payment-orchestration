@@ -1,0 +1,16 @@
+# Provisioned rather than clicked. A dashboard that needs someone to add a
+# datasource by hand before it renders is a dashboard nobody sees.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Container name, not localhost: Grafana reaches Prometheus across the
+    # compose network, while Prometheus reaches the services on the host.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

@@ -127,6 +127,11 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
     volumes:
       - grafana_data:/var/lib/grafana
+      # Provisioned from the repository rather than clicked together. A
+      # dashboard that lives only in a container volume disappears with it, and
+      # one that needs a datasource added by hand is one nobody opens twice.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
 

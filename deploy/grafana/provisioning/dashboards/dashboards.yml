@@ -1,0 +1,16 @@
+# Loads every dashboard JSON mounted under /var/lib/grafana/dashboards.
+
+apiVersion: 1
+
+providers:
+  - name: payment-orchestrator
+    type: file
+    disableDeletion: true
+    # The files are the source of truth: edits made in the UI are overwritten on
+    # the next reload, which is the point. A dashboard that lives only in a
+    # container volume disappears with the volume.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
