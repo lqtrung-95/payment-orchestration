@@ -764,8 +764,12 @@ Stated plainly, because a README that omits them is not worth reading.
   per-partition consumers would change the ordering the retry ladder depends on.
 - **No outage, spike, or soak run.** Those k6 profiles exist and have never been
   executed, so nothing is claimed about failover timing or memory over hours.
-- **No Grafana dashboard.** The metrics are exported and correct; nothing
-  renders them. `make invariants` and `make provider-health` are the substitute.
+- **No Grafana dashboard.** The metrics are exported, scraped, and correct;
+  nothing renders them. `make invariants` and `make provider-health` are the
+  substitute.
+- **No spans on database calls.** The trace covers HTTP, the outbox, Kafka, and
+  the provider call; time spent in Postgres appears as a gap inside those spans
+  rather than as its own.
 - **No Stripe adapter.** It needs a real Stripe account and key. The interface
   and registry are built so it slots in without touching orchestration.
 - **`processed_events` and `webhook_events_raw` grow unbounded** — both need
@@ -790,12 +794,17 @@ Stated plainly, because a README that omits them is not worth reading.
 | 05 | Webhook ingest, dedup, out-of-order tolerance | Done |
 | 06 | Payment instrument binding + lifecycle | Skipped |
 | 07 | FX conversion + settlement reconciliation | Done |
-| 08 | Sharding + cross-shard transactions (TCC) | Partly done |
-| 09 | Metrics, tracing, invariant checker, load + chaos testing | Partly done |
-| 10 | Architecture docs and demo | |
+| 08 | Sharding + cross-shard transactions (TCC) | Done, minus resharding tooling and a balance cache |
+| 09 | Metrics, tracing, invariant checker, load + chaos testing | Done, minus a Grafana dashboard and the outage/spike/soak runs |
+| 10 | Architecture docs and demo | Done, minus a walkthrough video |
 
 Phases 01–05 are the shippable core: a payment can be created, authorized
 asynchronously, retried intelligently, and resolved by a callback that may arrive
-duplicated, out of order, or early. Everything after this is depth — instrument
-lifecycle, FX and reconciliation, sharding, and the observability needed to put
-real numbers in this README.
+duplicated, out of order, or early. Everything after is depth — FX and
+reconciliation, sharding with cross-shard transfers, and the observability that
+put real numbers in this README.
+
+"Done, minus X" is deliberate. Each of those phases produced something that
+works and is tested; what is named is what was cut or never run, and it is
+listed again under [Known gaps](#known-gaps) rather than left to be inferred
+from a status word.

@@ -11,3 +11,13 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:8080"]
     metrics_path: /metrics
+
+  # The worker is scraped separately because it is the only producer of
+  # provider latency, provider error classes, retry ladder traffic, and circuit
+  # breaker state. The orchestrator registers those same names and never writes
+  # them, so scraping only :8080 shows a provider that never fails while the
+  # worker is failing every call.
+  - job_name: payment-worker
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+    metrics_path: /metrics
