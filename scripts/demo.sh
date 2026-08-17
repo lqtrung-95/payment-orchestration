@@ -29,6 +29,10 @@ export KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:9092}"
 # run's backlog and spends its first minute working through history.
 export KAFKA_TOPIC_PREFIX="demo-$(date +%s)."
 
+# Minted at the start of the run. The API is authenticated, so the demo has to
+# hold a real credential rather than assert an identity in a header.
+API_KEY=""
+
 LOGS=".demo-logs"
 FAILURES=0
 
@@ -64,12 +68,12 @@ fault()   { curl -sf -X PUT "$SIM/admin/faults" -H 'Content-Type: application/js
 # pay creates a payment and echoes its id.
 pay() { # key amount
   curl -sf -X POST "$API/v1/payments" \
-    -H "X-Merchant-Id: $MERCHANT" -H "Idempotency-Key: $1" \
+    -H "Authorization: Bearer $API_KEY" -H "Idempotency-Key: $1" \
     -H 'Content-Type: application/json' \
     -d "{\"amount\":$2,\"currency\":\"USD\"}" | jq -r .id
 }
 
-state() { curl -sf -H "X-Merchant-Id: $MERCHANT" "$API/v1/payments/$1" | jq -r .state; }
+state() { curl -sf -H "Authorization: Bearer $API_KEY" "$API/v1/payments/$1" | jq -r .state; }
 
 # await_state polls until the payment reaches one of the wanted states.
 await_state() { # id timeout_s want...
@@ -139,7 +143,7 @@ say "can only ever arrive as a webhook"
 # the parent leaves that child alive, still holding its port — so cleanup would
 # quietly orphan a server and the next run would refuse to start.
 BIN=$(mktemp -d)
-for c in pspsim orchestrator worker; do go build -o "$BIN/$c" "./cmd/$c"; done
+for c in pspsim orchestrator worker apikeyctl; do go build -o "$BIN/$c" "./cmd/$c"; done
 
 PSPSIM_WEBHOOK_URL="$API/webhooks/psp-sim" "$BIN/pspsim" >"$LOGS/pspsim.log" 2>&1 &
 PIDS="$!"
@@ -157,6 +161,40 @@ printf '\n'
 curl -sf "$API/readyz" | jq -c . || { echo "service never became ready" >&2; exit 1; }
 preset healthy
 
+say ""
+say "minting an API key — the merchant is no longer something a caller asserts"
+API_KEY=$("$BIN/apikeyctl" issue -merchant "$MERCHANT" -name demo 2>/dev/null)
+[[ -n "$API_KEY" ]] || { echo "could not issue an api key" >&2; exit 1; }
+say "issued ${API_KEY:0:12}... (shown once, stored only as a SHA-256 digest)"
+
+say ""
+say "the same request without it:"
+unauth=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/v1/payments" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: unauth-probe' \
+  -d '{"amount":1000,"currency":"USD"}')
+check "unauthenticated create" "$unauth" "401"
+
+# Drive one payment all the way through before anything is asserted.
+#
+# The worker joins a consumer group against topics created moments earlier, and
+# the broker can take tens of seconds to finish that rebalance. Until it does,
+# messages sit unconsumed and a timing-sensitive assertion fails for a reason
+# that has nothing to do with the behaviour it is testing — which is exactly
+# what happened once, and a demo that flakes is a demo that flakes on camera.
+#
+# Waiting for a real payment to complete is the only proof that the whole
+# pipeline is live. The simulator is reset afterwards so the warm-up leaves no
+# trace in the counts the acts below assert on.
+say ""
+say "warming up: one payment through the whole pipeline before anything is timed"
+warmup=$(pay warmup-000 1000)
+if [[ "$(await_state "$warmup" 90 authorized)" != "authorized" ]]; then
+  echo "the pipeline never came up: warm-up payment stayed at $(state "$warmup")" >&2
+  exit 1
+fi
+curl -sf -X POST "$SIM/admin/reset" >/dev/null
+say "pipeline live; simulator counters reset"
+
 # ── 1. Authorization is off the request path ─────────────────────────────────
 
 act "1. The caller never waits on a third party"
@@ -165,11 +203,19 @@ say "POST /v1/payments writes the transaction, its audit row, and the queue"
 say "message in ONE database transaction, then returns."
 
 start=$(date +%s%N)
-id=$(pay demo-001 12550)
+created=$(curl -sf -X POST "$API/v1/payments" \
+  -H "Authorization: Bearer $API_KEY" -H "Idempotency-Key: demo-001" \
+  -H 'Content-Type: application/json' -d '{"amount":12550,"currency":"USD"}')
 elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+id=$(jq -r .id <<<"$created")
 
 printf '  created %s in %sms\n' "$id" "$elapsed"
-check "state on create" "$(state "$id")" "created"
+
+# Asserted against the response the caller was handed, not a read taken after
+# it. Once the pipeline is warm the worker can move the payment to authorizing
+# before a follow-up read lands — which is the system working, and would make a
+# re-read flake between 'created' and 'authorizing' for no good reason.
+check "state the caller was returned" "$(jq -r .state <<<"$created")" "created"
 [[ $elapsed -lt 200 ]] && pass "returned in ${elapsed}ms (no provider in the request path)" \
                        || fail "took ${elapsed}ms — a provider call leaked into the request path"
 
@@ -185,17 +231,20 @@ act "2. One key, one payment"
 
 say "the same key again — byte-identical replay, no second transaction"
 replay_hdr=$(curl -sf -D - -o /dev/null -X POST "$API/v1/payments" \
-  -H "X-Merchant-Id: $MERCHANT" -H "Idempotency-Key: demo-001" \
+  -H "Authorization: Bearer $API_KEY" -H "Idempotency-Key: demo-001" \
   -H 'Content-Type: application/json' -d '{"amount":12550,"currency":"USD"}' \
   | grep -i '^idempotency-replayed' | tr -d '\r' || true)
 printf '  %s\n' "${replay_hdr:-<no replay header>}"
 check "replayed" "$(echo "$replay_hdr" | grep -ci true || true)" "1"
-check "transactions" "$(q 'SELECT count(*) FROM payment_transactions')" "1"
+# Counted by the idempotency key rather than as a total, which is the precise
+# claim: this key produced one transaction. A table-wide count would also be
+# counting the warm-up payment and anything a previous act left behind.
+check "transactions for this key" "$(q "SELECT count(*) FROM payment_transactions WHERE idempotency_key = 'demo-001'")" "1"
 
 say "the same key with a DIFFERENT amount — 409, not a silent replay that would"
 say "discard the second payment"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/v1/payments" \
-  -H "X-Merchant-Id: $MERCHANT" -H "Idempotency-Key: demo-001" \
+  -H "Authorization: Bearer $API_KEY" -H "Idempotency-Key: demo-001" \
   -H 'Content-Type: application/json' -d '{"amount":99999,"currency":"USD"}')
 check "conflicting body" "$code" "409"
 beat

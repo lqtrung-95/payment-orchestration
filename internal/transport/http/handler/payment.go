@@ -91,11 +91,17 @@ func (h *Payment) Create(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	merchantID, ok := middleware.MerchantFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+
 	t, err := h.service.Create(ctx, payment.CreateInput{
-		MerchantID:     string(c.Request.Header.Peek(middleware.MerchantIDHeader)),
+		MerchantID:     merchantID,
 		IdempotencyKey: string(c.Request.Header.Peek(middleware.IdempotencyKeyHeader)),
 		Amount:         amount,
-		Actor:          "api:" + string(c.Request.Header.Peek(middleware.MerchantIDHeader)),
+		Actor:          "api:" + merchantID,
 		SourceIP:       c.ClientIP(),
 	})
 	if err != nil {
@@ -132,12 +138,9 @@ type captureRequest struct {
 
 // Capture handles POST /v1/payments/:id/capture.
 func (h *Payment) Capture(ctx context.Context, c *app.RequestContext) {
-	merchantID := string(c.Request.Header.Peek(middleware.MerchantIDHeader))
-	if merchantID == "" {
-		c.AbortWithStatusJSON(consts.StatusBadRequest, utils.H{
-			"error":   "merchant_required",
-			"message": "X-Merchant-Id header is required",
-		})
+	merchantID, ok := middleware.MerchantFrom(c)
+	if !ok {
+		unauthenticated(c)
 		return
 	}
 
@@ -249,12 +252,9 @@ func (h *Payment) respondToCaptureError(
 
 // Get handles GET /v1/payments/:id.
 func (h *Payment) Get(ctx context.Context, c *app.RequestContext) {
-	merchantID := string(c.Request.Header.Peek(middleware.MerchantIDHeader))
-	if merchantID == "" {
-		c.AbortWithStatusJSON(consts.StatusBadRequest, utils.H{
-			"error":   "merchant_required",
-			"message": "X-Merchant-Id header is required",
-		})
+	merchantID, ok := middleware.MerchantFrom(c)
+	if !ok {
+		unauthenticated(c)
 		return
 	}
 
@@ -278,4 +278,19 @@ func (h *Payment) Get(ctx context.Context, c *app.RequestContext) {
 	}
 
 	c.JSON(consts.StatusOK, toResponse(t))
+}
+
+// unauthenticated answers a handler that was somehow reached without an
+// authenticated merchant.
+//
+// It should be unreachable — the route group is behind the authentication
+// middleware — and is written anyway, because "unreachable" is a property of
+// the current routing table rather than of this function. Falling back to an
+// empty merchant would be a tenant that matches nothing and owns nothing, which
+// fails in ways that look like data loss rather than like a bug.
+func unauthenticated(c *app.RequestContext) {
+	c.AbortWithStatusJSON(consts.StatusUnauthorized, utils.H{
+		"error":   "authorization_required",
+		"message": "an Authorization: Bearer <api key> header is required",
+	})
 }

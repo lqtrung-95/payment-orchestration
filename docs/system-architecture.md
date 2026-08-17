@@ -62,8 +62,12 @@ is a second source of truth ([ADR 0002](adr/0002-double-entry-ledger-with-derive
 | Route | Purpose |
 |---|---|
 | `POST /v1/payments` | Create. Returns in `created`; authorization is asynchronous. |
-| `GET /v1/payments/:id` | Read, scoped to `X-Merchant-Id`. |
+| `GET /v1/payments/:id` | Read, scoped to the authenticated merchant. |
 | `POST /v1/payments/:id/capture` | Capture, in full or partially. |
+
+Everything under `/v1` requires `Authorization: Bearer <api key>`. The webhook
+route deliberately does not: providers hold no key and authenticate the other
+way round, by signing the bytes they send.
 | `POST /webhooks/:provider` | Provider callbacks. Public, signature-verified. |
 | `GET /healthz` `GET /readyz` | Liveness, and readiness across every shard. |
 | `GET /metrics` | Prometheus, including the must-be-zero gauges. |
@@ -318,6 +322,7 @@ change in the hash function send reads to a database that does not hold the rows
 | `idempotency_keys` | Merchant's shard | Co-located with the payment the claim guards, so a shard outage takes both. |
 | `fee_schedules`, `fx_rates`, `fx_rate_locks` | Every shard | Read inside shard transactions. Replicated reference data. |
 | `webhook_events_raw` | Shard 0 | An event arrives before any payment has been resolved from it. |
+| `api_keys` | Shard 0 | Authentication happens before the merchant — and therefore the shard — is known. |
 | `processed_events` | Shard 0 | An event id carries no merchant; one unique index arbitrates for every message. |
 | `settlement_*`, `recon_*` | Shard 0 | Per-provider back-office records, not per-merchant. |
 | `tcc_transfers` | Shard 0 | Spans two merchants and belongs to neither shard. |
@@ -487,9 +492,10 @@ Numbers, hardware, and commands are in [`docs/benchmarks/`](benchmarks/README.md
 
 Stated here because an omitted component is easily mistaken for an implied one.
 
-- **No authentication.** `X-Merchant-Id` is an unauthenticated header. Tenant
-  isolation is only as real as that header, and it is the reason transfers have
-  a CLI rather than an HTTP endpoint.
+- **No scopes on API keys**, and no per-key rate limiting. A key does
+  everything its merchant can.
+- **Cross-shard transfers still have no HTTP surface.** Authentication now
+  makes one possible; it has not been built.
 - **No resharding tooling.** The mapping supports growth; nothing copies rows
   between databases or coordinates a cutover.
 - **No balance cache.** Balances are derived from postings on every read.

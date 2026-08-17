@@ -21,6 +21,15 @@ import exec from 'k6/execution';
 const API = __ENV.API || 'http://localhost:8080';
 const MERCHANT = __ENV.MERCHANT || 'm_loadtest';
 
+// The API is authenticated, so a run needs a real key. Minted out of band with
+// `apikeyctl issue -merchant m_loadtest` and passed in, rather than generated
+// here: a load test that could create its own credentials would be a load test
+// that had to be trusted with the ability to.
+const API_KEY = __ENV.API_KEY;
+if (!API_KEY) {
+  throw new Error('API_KEY is required: apikeyctl issue -merchant ' + MERCHANT);
+}
+
 // A run id namespaces idempotency keys, so repeated runs against the same
 // database do not collide and replay each other's payments — which would
 // silently turn a load test into a replay test.
@@ -133,7 +142,7 @@ export default function () {
     {
       headers: {
         'Content-Type': 'application/json',
-        'X-Merchant-Id': MERCHANT,
+        Authorization: `Bearer ${API_KEY}`,
         'Idempotency-Key': key,
       },
       tags: { name: 'create_payment' },

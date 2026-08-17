@@ -63,6 +63,7 @@ build: ## Build binaries into bin/
 	go build -o $(BIN_DIR)/webhookctl ./cmd/webhookctl
 	go build -o $(BIN_DIR)/reconctl ./cmd/reconctl
 	go build -o $(BIN_DIR)/transferctl ./cmd/transferctl
+	go build -o $(BIN_DIR)/apikeyctl ./cmd/apikeyctl
 
 .PHONY: run
 run: ## Run the orchestrator against the local stack
@@ -96,6 +97,14 @@ replay: ## Re-evaluate the stored webhook log against current state (writes noth
 breaks: ## List open reconciliation breaks
 	go run ./cmd/reconctl breaks -status open
 
+.PHONY: apikey
+apikey: ## Mint an API key for a merchant (MERCHANT=m_acme)
+	@go run ./cmd/apikeyctl issue -merchant $(or $(MERCHANT),m_acme) -name manual
+
+.PHONY: apikeys
+apikeys: ## List API keys, without their secrets
+	@go run ./cmd/apikeyctl list
+
 .PHONY: charges
 charges: ## Show what the simulated provider believes it charged
 	@curl -s $(PSPSIM_URL)/admin/charges | jq '{count, charges: [.charges[] | {reference, status, amount_minor}]}'
@@ -112,18 +121,22 @@ sweep: ## Resolve transfers whose coordinator stopped
 
 RUN_ID ?= $(shell date +%s)
 
+# The load profiles authenticate like any other caller. Mint a key once and
+# export it, or let these targets mint a throwaway one per run.
+API_KEY ?= $(shell go run ./cmd/apikeyctl issue -merchant m_loadtest -name loadtest 2>/dev/null)
+
 .PHONY: load-smoke
 load-smoke: ## Correctness-only load run (10 rps, 30s)
-	k6 run -e PROFILE=smoke -e RUN_ID=$(RUN_ID) loadtest/payments.js
+	k6 run -e PROFILE=smoke -e API_KEY=$(API_KEY) -e RUN_ID=$(RUN_ID) loadtest/payments.js
 
 .PHONY: load-baseline
 load-baseline: ## Ramping load run against a healthy provider
-	k6 run -e PROFILE=baseline -e RUN_ID=$(RUN_ID) loadtest/payments.js
+	k6 run -e PROFILE=baseline -e API_KEY=$(API_KEY) -e RUN_ID=$(RUN_ID) loadtest/payments.js
 
 .PHONY: load-chaos
 load-chaos: ## Ramping load run with the full fault catalogue live
 	@curl -s -X PUT "$(PSPSIM_URL)/admin/faults/preset?name=chaos" >/dev/null
-	k6 run -e PROFILE=chaos -e RUN_ID=$(RUN_ID) loadtest/payments.js
+	k6 run -e PROFILE=chaos -e API_KEY=$(API_KEY) -e RUN_ID=$(RUN_ID) loadtest/payments.js
 
 .PHONY: invariants
 invariants: ## Show the must-be-zero counters and the queue depths

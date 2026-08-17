@@ -17,7 +17,6 @@ import (
 
 const (
 	IdempotencyKeyHeader = "Idempotency-Key"
-	MerchantIDHeader     = "X-Merchant-Id"
 
 	maxIdempotencyKeyLen = 255
 )
@@ -50,12 +49,13 @@ func Idempotency(router *postgres.Router, repo *idempotency.Repository, logger *
 			return
 		}
 
-		merchantID := string(c.Request.Header.Peek(MerchantIDHeader))
-		if merchantID == "" {
-			c.AbortWithStatusJSON(consts.StatusBadRequest, utils.H{
-				"error":   "merchant_required",
-				"message": "X-Merchant-Id header is required",
-			})
+		// From the authentication middleware, which must run first: the claim
+		// is scoped per merchant, so taking the merchant from a header would
+		// let one caller replay or block another's key.
+		merchantID, ok := MerchantFrom(c)
+		if !ok {
+			unauthorized(c, "authorization_required",
+				"an Authorization: Bearer <api key> header is required")
 			return
 		}
 

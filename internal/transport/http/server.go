@@ -7,6 +7,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
+	"github.com/lequoctrung/payment-orchestrator/internal/auth"
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/metrics"
 	"github.com/lequoctrung/payment-orchestrator/internal/platform/postgres"
@@ -27,6 +28,7 @@ type Deps struct {
 	Health          []handler.NamedChecker
 	PaymentService  *payment.Service
 	IdempotencyRepo *idempotency.Repository
+	APIKeys         *auth.Store
 	WebhookIngestor *webhook.Ingestor
 	Metrics         *metrics.Metrics
 }
@@ -80,8 +82,42 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 		h.GET("/metrics", handler.Prometheus(deps.Metrics))
 	}
 
+	// The merchant-facing surface is registered only when its dependencies are
+	// all present, and refuses to be registered when they are not.
+	//
+	// A panic rather than a silent skip, because the failure it guards against
+	// is a payment API that boots and serves without authentication. Refusing
+	// to start is loud, immediate, and happens on somebody's laptop; the
+	// alternative is discovered by whoever finds the endpoint first.
+	if deps.PaymentService != nil {
+		if deps.Router == nil || deps.APIKeys == nil {
+			panic("payment routes need a shard router and an api key store to authenticate with")
+		}
+		registerPaymentRoutes(h, deps)
+	}
+
+	// Outside /v1 and outside the idempotency middleware. Providers do not send
+	// an Idempotency-Key, and webhook deduplication is by the provider's own
+	// event id against a unique index — a different mechanism for a different
+	// party, deliberately not sharing the merchant-facing one.
+	if deps.WebhookIngestor != nil {
+		webhooks := handler.NewWebhook(deps.WebhookIngestor, deps.Metrics, deps.Logger)
+		h.POST("/webhooks/:provider", webhooks.Receive)
+	}
+
+	return h
+}
+
+// registerPaymentRoutes mounts the authenticated merchant-facing surface.
+//
+// Authentication is applied to the group rather than to each route. Per route
+// it would be one edit away from a new endpoint that silently serves anybody,
+// and the endpoint that gets forgotten is the one added in a hurry.
+func registerPaymentRoutes(h *server.Hertz, deps Deps) {
 	payments := handler.NewPayment(deps.PaymentService, deps.Logger)
-	v1 := h.Group("/v1")
+
+	v1 := h.Group("/v1",
+		middleware.Authenticate(deps.Router.Global(), deps.APIKeys, deps.Logger))
 
 	// Idempotency is applied per route rather than to the whole group. A GET is
 	// already idempotent, and requiring a key on it would reject valid requests
@@ -98,15 +134,4 @@ func New(cfg *config.Config, deps Deps) *server.Hertz {
 		middleware.Idempotency(deps.Router, deps.IdempotencyRepo, deps.Logger),
 		payments.Capture,
 	)
-
-	// Outside /v1 and outside the idempotency middleware. Providers do not send
-	// an Idempotency-Key, and webhook deduplication is by the provider's own
-	// event id against a unique index — a different mechanism for a different
-	// party, deliberately not sharing the merchant-facing one.
-	if deps.WebhookIngestor != nil {
-		webhooks := handler.NewWebhook(deps.WebhookIngestor, deps.Metrics, deps.Logger)
-		h.POST("/webhooks/:provider", webhooks.Receive)
-	}
-
-	return h
 }

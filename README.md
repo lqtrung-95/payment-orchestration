@@ -173,6 +173,42 @@ over those exact bytes, and normalising them means the stored event can never be
 verified again. `webhookctl replay` re-reads the log and reports what would
 change; a healthy log changes nothing.
 
+### The merchant is authenticated, not asserted
+
+`Authorization: Bearer pmt_<public>_<secret>`. The old `X-Merchant-Id` header is
+gone; presenting it now returns 401.
+
+The secret is stored as a **SHA-256 digest and is never recoverable** — shown
+once at issue, then only in the caller's hands. Not bcrypt: password hashes are
+slow on purpose because they protect secrets humans chose, and this one is 32
+bytes from `crypto/rand`, where there is no dictionary to attack and slowness
+would only tax every request.
+
+A hash is not searchable, so the key carries a plaintext public half that is
+uniquely indexed. Verification is one row lookup and one
+`subtle.ConstantTimeCompare` — an early-returning compare leaks how much of a
+guess was right.
+
+Keys live on shard 0, because authentication happens *before* the merchant is
+known and there is no shard key to route on yet. Same reason as the webhook log.
+
+The middleware passes the merchant to handlers **out of band**, in the request
+context. A handler that read it from a header could not tell whether the
+middleware or the caller put it there.
+
+Verified against a running service:
+
+```
+no Authorization header      → 401
+garbage bearer token         → 401
+X-Merchant-Id: m_alpha       → 401     ← the old trusted path
+valid key                    → 201
+revoked key                  → 401
+
+payment created by m_alpha, read with m_beta's key → 404
+secret found in the database → 0 rows
+```
+
 ### Merchants live on different databases
 
 Sixty-four logical shards, derived from the merchant and stored on every row.
@@ -746,14 +782,19 @@ the alternatives that were seriously considered and rejected.
 - [0008 — Webhook ingestion, deduplication, and ordering](docs/adr/0008-webhook-ingestion-and-ordering.md)
 - [0009 — FX, capture postings, and settlement reconciliation](docs/adr/0009-fx-capture-postings-and-reconciliation.md)
 - [0010 — Physical sharding and cross-shard transfers](docs/adr/0010-physical-sharding-and-cross-shard-transfers.md)
+- [0011 — API key authentication](docs/adr/0011-api-key-authentication.md)
 
 ## Known gaps
 
 Stated plainly, because a README that omits them is not worth reading.
 
-- **No authentication.** `X-Merchant-Id` is an unauthenticated header — any
-  caller can claim to be any merchant. The tenant isolation is only as real as
-  that header. Must be replaced before this is exposed anywhere.
+- **No scopes on API keys.** A key can do everything its merchant can; there
+  are no read-only keys and no per-endpoint permissions.
+- **No rate limiting per key**, which is the natural place for it now that
+  callers are identified.
+- **`apikeyctl` authenticates to the database, not to the service.** Anyone who
+  can reach Postgres can mint a key — the same trust boundary the migration
+  tooling already assumes.
 - **No reaper for expired idempotency records**, so that table grows unbounded.
 - **Refund has no HTTP surface.** It exists on the aggregate and is tested, but
   is not exposed and refund settlement rows are not classified.

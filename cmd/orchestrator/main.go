@@ -13,6 +13,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/lequoctrung/payment-orchestrator/internal/auth"
 	"github.com/lequoctrung/payment-orchestrator/internal/config"
 	"github.com/lequoctrung/payment-orchestrator/internal/invariant"
 	"github.com/lequoctrung/payment-orchestrator/internal/messaging"
@@ -240,6 +241,7 @@ func run() error {
 		},
 		PaymentService:  paymentService,
 		IdempotencyRepo: idempotencyRepo,
+		APIKeys:         auth.NewStore(),
 		WebhookIngestor: ingestor,
 		Metrics:         meters,
 	})
